@@ -33,6 +33,12 @@ pip install -r requirements.txt
 python -m tests.smoke_forward
 ```
 
+如果在线平台没有把当前目录加入模块搜索路径，也可以直接运行：
+
+```powershell
+python tests/smoke_forward.py
+```
+
 ## 最小训练闭环
 
 先用合成的移动光斑视频验证模型可以前向、反向传播和保存权重：

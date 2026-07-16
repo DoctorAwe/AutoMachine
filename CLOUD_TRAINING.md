@@ -37,6 +37,19 @@ python -m tests.smoke_forward
 
 看到 `OK output_shape=...` 就说明模型前向可用。
 
+如果平台提示 `No module named tests.smoke_forward`，先确认当前目录是项目根目录：
+
+```bash
+pwd
+ls
+```
+
+目录里应该能看到 `automachine/`、`tests/`、`requirements.txt`。如果仍然报错，使用直接路径运行：
+
+```bash
+python tests/smoke_forward.py
+```
+
 ## 4. 跑一个最小训练闭环
 
 ```bash
