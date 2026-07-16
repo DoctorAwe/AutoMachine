@@ -1,37 +1,24 @@
-"""Smoke test for the neural stream processor prototype.
-
-Run:
-    python -m tests.smoke_forward
-"""
-
 from __future__ import annotations
 
 import torch
 
-from automachine import NeuralStreamProcessor, NeuralStreamProcessorConfig
+from automachine import SynchronousControlConfig, SynchronousControlProcessor
 
 
 def main() -> None:
-    torch.manual_seed(7)
-    config = NeuralStreamProcessorConfig(
-        image_size=64,
-        chunk_size=3,
+    config = SynchronousControlConfig(
+        image_size=96,
+        response_dim=16,
+        frames_per_step=2,
         token_dim=64,
-        state_tokens=(64, 64, 96),
-        num_heads=4,
+        state_tokens=(16, 24, 32),
     )
-    model = NeuralStreamProcessor(config)
-    video = torch.rand(2, 6, 3, 64, 64)
-    output = model(video)
-
-    expected_shape = (2, 4, 3, 64, 64)
-    if tuple(output.shape) != expected_shape:
-        raise AssertionError(f"Expected {expected_shape}, got {tuple(output.shape)}")
-    if not torch.isfinite(output).all():
-        raise AssertionError("Model output contains non-finite values")
-
-    parameters = sum(param.numel() for param in model.parameters())
-    print(f"OK output_shape={tuple(output.shape)} parameters={parameters:,}")
+    model = SynchronousControlProcessor(config)
+    video = torch.rand(2, 4, 3, 96, 96)
+    response, state = model.forward_chunk(video)
+    assert response.shape == (2, 2, 16)
+    assert state.step == 2
+    print(f"OK response={tuple(response.shape)} memory_step={state.step}")
 
 
 if __name__ == "__main__":

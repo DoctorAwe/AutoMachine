@@ -1,45 +1,31 @@
-# 可用真实时序数据集
+# 同步感知—响应数据集
 
-## 推荐顺序
+项目只优先考虑具有共同时间轴的输入与响应/动作数据。
 
-### 1. UCI HAR（现在即可接入）
+## 1. ActionSense
 
-- 30 名受试者，手机腰部佩戴；三轴加速度与三轴陀螺仪，50 Hz。
-- 官方压缩包约 58 MB，原始惯性窗口已经整理成 128×9，CC BY 4.0。
-- 适合先做“过去信号 → 后续信号”预测，数据轻、下载和显存压力低。
-- 官方页面：https://archive.ics.uci.edu/dataset/240/human+activity+recognition+using+smartphones
-- 本仓库转换器：`python -m automachine.prepare_uci_har`。
+真实人类厨房活动：第一视角和环境视频、双臂 EMG、身体姿态、眼动、触觉与活动标签同步。首个任务选择单人 `S04` 的第一视角视频到 16 通道 EMG。详见 [ACTIONSENSE.md](ACTIONSENSE.md)。
 
-这是当前首选：先证明模型能学习真实人体运动动力学，再扩大模型或处理高采样率信号。
+官方入口：https://action-sense.csail.mit.edu/data.html
 
-### 2. PhysioNet GRABMyo（第二阶段）
+## 2. LeRobot PushT
 
-- 43 名健康参与者、16 种手势、3 次采集；EMG 采样率 2048 Hz。
-- 32 通道记录，完整数据解压约 9.4 GB，PhysioNet Credentialed Health Data License 1.5.0。
-- 适合波形续写、动作分类辅助任务，以及输入 EMG → 输出运动状态。
-- 官方页面：https://physionet.org/content/grabmyo/1.1.0/
+约 31.6 MB，包含 96×96 图像、二维状态和同步二维动作。适合在接入大型真实数据之前验证视觉控制映射。
 
-建议在云端下载，先降采样到 256–512 Hz 并切成 1–2 秒窗口；不要直接把全部 2048 Hz 长记录送进注意力层。
+官方入口：https://huggingface.co/datasets/lerobot/pusht_image
 
-### 3. DANDI 000728（神经活动路线）
+## 3. DROID-100
 
-- Allen Visual Coding 光学成像；NWB 文件中可直接取 `DfOverF`，形状为 `[时间, ROI]`。
-- 同时含行为视频，后续可研究“神经活动/视觉输入 → 行为”的多模态任务。
-- DANDI 文档示例：https://docs.dandiarchive.org/example-notebooks/tutorials/open_data_quick_start_2026/Get-to-know-a-Dandiset/
+真实机器人多视角视频、机器人状态和 7 维动作。官方提供约 2 GB 的 100-episode 调试子集；完整 RLDS 数据约 1.7 TB。
 
-这条路线科学价值高，但需要 `dandi`、`pynwb` 和按文件流式读取，放在模型闭环验证之后。
+官方入口：https://droid-dataset.github.io/droid/the-droid-dataset
 
-## 暂不优先
+## 统一任务约定
 
-- 原始动物视频/DeepLabCut：适合最终的视频输入目标，但下载、解码和标注格式差异较大。
-- 大规模 Neuropixels：通道数与采样率都高，应先设计分块、降采样和稀疏读出。
-
-## 统一数据约定
-
-特征训练入口读取：
-
-```python
-sequences.shape == [samples, time, features]
+```text
+observations: [episode, time, modality...]
+responses:    [episode, time, response_dim]
+timestamps:   [episode, time]
 ```
 
-训练时目标与模型输出自动按下一时刻对齐。正式实验必须按受试者或 session 切分，不能把同一人的相邻窗口随机分到训练和测试集。
+训练、验证和测试必须按完整 episode 切分，不能先切相邻窗口再随机分组。

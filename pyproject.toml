@@ -1,7 +1,7 @@
 [project]
 name = "automachine"
 version = "0.1.0"
-description = "Hierarchical streaming transformer prototype for temporal signal input/output."
+description = "Causal streaming processor for synchronous perception-to-response control."
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [

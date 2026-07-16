@@ -1,13 +1,5 @@
-"""AutoMachine neural stream processor prototype."""
+"""AutoMachine synchronous perception-to-control processor."""
 
-from .model import NeuralStreamProcessor, NeuralStreamProcessorConfig
-from .feature_model import FeatureStreamProcessor, FeatureStreamProcessorConfig
-from .synthetic import MovingBlobVideoDataset
+from .model import ControlState, SynchronousControlConfig, SynchronousControlProcessor
 
-__all__ = [
-    "FeatureStreamProcessor",
-    "FeatureStreamProcessorConfig",
-    "MovingBlobVideoDataset",
-    "NeuralStreamProcessor",
-    "NeuralStreamProcessorConfig",
-]
+__all__ = ["ControlState", "SynchronousControlConfig", "SynchronousControlProcessor"]

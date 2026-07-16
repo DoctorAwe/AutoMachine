@@ -1,59 +1,74 @@
-# AutoMachine / 神经处理机
+# AutoMachine / 同步神经处理机
 
-基于 Transformer 思路的流式时域信号输入/输出试作模型。当前版本包含两条路径：
+AutoMachine 是一个面向连续感知与控制的因果流式模型：
 
 ```text
-视频帧块 -> 时空编码器 -> 分层持久 Token 记忆 -> 多尺度读出 -> 视频帧
-特征序列 -> 时间编码器 -> 分层持久 Token 记忆 -> 多尺度读出 -> 特征向量
+同步视觉/传感器输入 -> 分层持久记忆 -> 同步响应/控制信号
 ```
 
-## 模型结构
+它不以预测下一帧为核心任务。模型在每个输入时刻产生一个同频率响应，并允许状态跨数据 chunk 持续存在。
 
-- `StreamEncoder`：使用 3D 卷积显式保留帧顺序，再以内容相关权重压缩时间维。
-- `HierarchicalMemoryPipeline`：不同容量的持久 Token 层，每步用交叉注意力、自注意力和门控残差更新。
-- 多尺度读出：解码时同时读取全部记忆层；浅层提供近期细节，深层提供较长上下文。
-- `FeatureStreamProcessor`：处理姿态、IMU、EMG、神经活动等 `[B,T,F]` 信号。
+## 核心结构
 
-## 环境与验证
+```text
+RGB 视频 [B,T,C,H,W]
+    -> 因果频率适配器（每 K 帧压缩为一个内部时刻）
+    -> 固定空间 Token 网格（保留局部信息）
+    -> 可选辅助传感器融合 [B,T,F]
+    -> 时间移位 Token 管线
+       - 新输入只进入第一层
+       - 旧 Layer i 状态在下一步流向 Layer i+1
+       - 后层可以使用更大的 Token 容量
+    -> 多尺度注意力读出
+    -> 同步响应 [B,T,A]
+```
 
-项目要求 Python 3.11+，建议重建本地虚拟环境后安装依赖：
+核心接口：
+
+```python
+from automachine import SynchronousControlConfig, SynchronousControlProcessor
+
+config = SynchronousControlConfig(
+    image_size=96,
+    frames_per_step=1,
+    auxiliary_features=0,
+    response_dim=16,
+    state_tokens=(16, 16, 24, 32),
+)
+model = SynchronousControlProcessor(config)
+
+response, state = model.forward_chunk(video_chunk)
+next_response, state = model.forward_chunk(next_video_chunk, state=state)
+```
+
+`ControlState.detach()` 用于截断跨 chunk 的反向传播历史，同时保留在线记忆值。
+
+## 验证
 
 ```powershell
-py -3.11 -m venv .venv
-.\.venv\Scripts\Activate.ps1
-python -m pip install -r requirements.txt
 python -m pytest -q
 python -m tests.smoke_forward
 ```
 
-合成视频仅用于验证前向、反向传播和 checkpoint：
+测试会验证：
+
+- 输入和输出严格逐时刻对齐；
+- 修改未来帧不会改变过去响应；
+- 整段处理与分 chunk 流式处理结果一致；
+- 新输入每个内部时刻只向后传播一层；
+- 不完整输入分组能跨 chunk 缓冲；
+- 可选辅助传感器能与视觉融合。
+
+## 最小训练闭环
+
+合成任务用移动目标视频同步输出位置和速度，只用于验证工程闭环：
 
 ```powershell
-python -m automachine.train --steps 20 --batch-size 4
+python -m automachine.train --steps 200 --device auto
 ```
 
-## 第一阶段真实数据：UCI HAR
+真实生物响应任务使用 ActionSense 的第一视角视频到双臂 16 通道 EMG，数据准备见 [ACTIONSENSE.md](ACTIONSENSE.md)。
 
-从 UCI 官方页面下载并解压 `UCI HAR Dataset.zip`，然后转换 50 Hz 九通道原始 IMU：
+## 输出安全边界
 
-```powershell
-python -m automachine.prepare_uci_har --source "D:\data\UCI HAR Dataset" --output data\uci_har
-python -m automachine.train_features --data data\uci_har\train.npz --input-length 96 --chunk-size 8 --steps 1000 --device auto
-```
-
-转换器沿用官方按受试者划分的 train/test 集，并且只用训练集统计量标准化，避免数据泄漏。更多候选见 [DATASETS.md](DATASETS.md)。云端训练步骤见 [CLOUD_TRAINING.md](CLOUD_TRAINING.md)。
-
-## Colab 在线预测展示
-
-把训练 checkpoint 放在 `checkpoints/`，安装展示依赖并启动：
-
-```bash
-pip install -r requirements-demo.txt
-python -m automachine.demo \
-  --data data/uci_har/test.npz \
-  --checkpoints checkpoints \
-  --device auto \
-  --share
-```
-
-终端会输出一个临时 `gradio.live` 公网地址。页面可以切换多个 checkpoint 和测试样本，对比九通道输入、真实后续信号、模型预测及“复制上一采样点”基线。
+模型输出应解释为归一化动作目标、速度目标、肌肉激活或其他高层响应。真实硬件的电流、电压和 PWM 应由带限幅、速率限制、急停和故障检测的确定性低层控制器产生，不应直接把未经约束的神经网络输出接到执行器。

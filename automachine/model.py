@@ -1,12 +1,9 @@
-"""Small hierarchical stream-processing model.
+"""Causal synchronous perception-to-response processor.
 
-This module implements the first executable shape of the "neural processor"
-idea from AGENTS.md:
-
-- encode a short chunk of raw video frames into compact tokens,
-- maintain multiple token-state layers with different capacities,
-- fuse each incoming step into persistent state by attention + gated update,
-- decode the current readout token grid back into a video frame.
+Raw observations are compressed to a fixed internal rate.  At each internal
+step, new perception enters the first token layer while every deeper layer
+receives the *previous-step* state of its predecessor.  A readout over current
+perception and all layers produces the synchronous response.
 """
 
 from __future__ import annotations
@@ -19,324 +16,331 @@ import torch.nn.functional as F
 
 
 @dataclass(frozen=True)
-class NeuralStreamProcessorConfig:
-    """Configuration for the small video next-frame prototype."""
-
-    image_size: int = 64
+class SynchronousControlConfig:
+    image_size: int = 96
     input_channels: int = 3
-    chunk_size: int = 3
-    token_dim: int = 128
-    encoder_grid: int = 8
-    state_tokens: tuple[int, ...] = (64, 64, 96, 128, 192)
+    auxiliary_features: int = 0
+    response_dim: int = 16
+    frames_per_step: int = 1
+    token_dim: int = 64
+    spatial_grid: int = 4
+    state_tokens: tuple[int, ...] = (16, 16, 24, 32)
     num_heads: int = 4
-    mlp_ratio: int = 4
-    output_channels: int = 3
+    mlp_ratio: int = 2
+    dropout: float = 0.0
+    response_activation: str = "none"
 
     def __post_init__(self) -> None:
-        if self.image_size <= 0 or self.chunk_size <= 0 or self.encoder_grid <= 0:
-            raise ValueError("image_size, chunk_size and encoder_grid must be positive")
-        if self.token_dim <= 0 or self.num_heads <= 0 or self.token_dim % self.num_heads:
-            raise ValueError("token_dim must be positive and divisible by num_heads")
-        if not self.state_tokens or any(count <= 0 for count in self.state_tokens):
-            raise ValueError("state_tokens must contain positive token counts")
-
-    @property
-    def encoder_tokens(self) -> int:
-        return self.encoder_grid * self.encoder_grid
-
-
-class StreamEncoder(nn.Module):
-    """Compresses a short video chunk into a fixed token grid."""
-
-    def __init__(self, config: NeuralStreamProcessorConfig) -> None:
-        super().__init__()
-        dim = config.token_dim
-        self.config = config
-        # Keep time as an explicit dimension.  The former implementation folded
-        # frames into channels, which made frame order unnecessarily hard to learn.
-        self.net = nn.Sequential(
-            nn.Conv3d(
-                config.input_channels,
-                dim // 2,
-                kernel_size=(3, 5, 5),
-                stride=(1, 2, 2),
-                padding=(1, 2, 2),
-            ),
-            nn.GELU(),
-            nn.Conv3d(
-                dim // 2,
-                dim,
-                kernel_size=(3, 3, 3),
-                stride=(1, 2, 2),
-                padding=1,
-            ),
-            nn.GELU(),
-            nn.Conv3d(
-                dim,
-                dim,
-                kernel_size=(3, 3, 3),
-                stride=(1, 2, 2),
-                padding=1,
-            ),
-            nn.GELU(),
+        positive = (
+            self.image_size, self.input_channels, self.response_dim,
+            self.frames_per_step, self.token_dim, self.spatial_grid,
+            self.num_heads, self.mlp_ratio,
         )
-        self.proj = nn.Conv2d(dim, dim, kernel_size=1)
-        self.temporal_score = nn.Conv3d(dim, 1, kernel_size=1)
-        self.pos = nn.Parameter(torch.zeros(1, config.encoder_tokens, dim))
-        nn.init.trunc_normal_(self.pos, std=0.02)
-
-    def forward(self, chunk: Tensor) -> Tensor:
-        """Encode a frame chunk.
-
-        Args:
-            chunk: Tensor shaped [batch, chunk_size, channels, height, width].
-
-        Returns:
-            Tensor shaped [batch, encoder_grid * encoder_grid, token_dim].
-        """
-        bsz, steps, channels, height, width = chunk.shape
-        expected = self.config
-        if steps != expected.chunk_size or channels != expected.input_channels:
-            raise ValueError(
-                f"Expected chunk [B, {expected.chunk_size}, "
-                f"{expected.input_channels}, H, W], got {tuple(chunk.shape)}"
-            )
-
-        x = self.net(chunk.transpose(1, 2))
-        # Content-dependent causal-chunk pooling preserves ordering information
-        # while still producing a fixed-rate token grid.
-        weights = self.temporal_score(x).mean(dim=(-1, -2), keepdim=True).softmax(dim=2)
-        x = self.proj((x * weights).sum(dim=2))
-        if x.shape[-2:] != (expected.encoder_grid, expected.encoder_grid):
-            x = F.adaptive_avg_pool2d(x, (expected.encoder_grid, expected.encoder_grid))
-        x = x.flatten(2).transpose(1, 2)
-        return x + self.pos
+        if any(value <= 0 for value in positive):
+            raise ValueError("Model dimensions and frames_per_step must be positive")
+        if self.auxiliary_features < 0:
+            raise ValueError("auxiliary_features cannot be negative")
+        if self.token_dim % self.num_heads:
+            raise ValueError("token_dim must be divisible by num_heads")
+        if not self.state_tokens or any(count <= 0 for count in self.state_tokens):
+            raise ValueError("state_tokens must contain positive values")
+        if not 0.0 <= self.dropout < 1.0:
+            raise ValueError("dropout must be in [0, 1)")
+        if self.response_activation not in {"none", "tanh"}:
+            raise ValueError("response_activation must be 'none' or 'tanh'")
 
 
-class TokenResampler(nn.Module):
-    """Maps an arbitrary token sequence to a target token count."""
+@dataclass
+class ControlState:
+    """Token pipeline state plus raw samples awaiting a complete input group."""
 
-    def __init__(self, target_tokens: int, token_dim: int, num_heads: int) -> None:
-        super().__init__()
-        self.query = nn.Parameter(torch.empty(1, target_tokens, token_dim))
-        self.norm = nn.LayerNorm(token_dim)
-        self.attn = nn.MultiheadAttention(token_dim, num_heads, batch_first=True)
-        nn.init.trunc_normal_(self.query, std=0.02)
+    layers: tuple[Tensor, ...]
+    step: int = 0
+    pending_video: Tensor | None = None
+    pending_auxiliary: Tensor | None = None
 
-    def forward(self, tokens: Tensor) -> Tensor:
-        bsz = tokens.shape[0]
-        query = self.query.expand(bsz, -1, -1)
-        key_value = self.norm(tokens)
-        resampled, _ = self.attn(query, key_value, key_value, need_weights=False)
-        return resampled
+    def detach(self) -> "ControlState":
+        return ControlState(
+            tuple(layer.detach() for layer in self.layers),
+            self.step,
+            None if self.pending_video is None else self.pending_video.detach(),
+            None if self.pending_auxiliary is None else self.pending_auxiliary.detach(),
+        )
 
 
 class FeedForward(nn.Module):
-    def __init__(self, token_dim: int, mlp_ratio: int) -> None:
+    def __init__(self, dim: int, ratio: int, dropout: float) -> None:
         super().__init__()
-        hidden = token_dim * mlp_ratio
         self.net = nn.Sequential(
-            nn.Linear(token_dim, hidden),
-            nn.GELU(),
-            nn.Linear(hidden, token_dim),
+            nn.Linear(dim, dim * ratio), nn.GELU(), nn.Dropout(dropout),
+            nn.Linear(dim * ratio, dim), nn.Dropout(dropout),
         )
 
-    def forward(self, x: Tensor) -> Tensor:
-        return self.net(x)
+    def forward(self, inputs: Tensor) -> Tensor:
+        return self.net(inputs)
 
 
-class StateFusionBlock(nn.Module):
-    """Attention + gate update for one persistent token-state layer."""
+class TokenResampler(nn.Module):
+    """Convert a token layer to the capacity expected by the next layer."""
 
-    def __init__(
-        self,
-        state_tokens: int,
-        token_dim: int,
-        num_heads: int,
-        mlp_ratio: int,
-    ) -> None:
+    def __init__(self, target_tokens: int, config: SynchronousControlConfig) -> None:
         super().__init__()
-        self.state_tokens = state_tokens
-        self.resampler = TokenResampler(state_tokens, token_dim, num_heads)
-        self.state_norm = nn.LayerNorm(token_dim)
-        self.incoming_norm = nn.LayerNorm(token_dim)
-        self.cross_attn = nn.MultiheadAttention(token_dim, num_heads, batch_first=True)
-        self.self_norm = nn.LayerNorm(token_dim)
-        self.self_attn = nn.MultiheadAttention(token_dim, num_heads, batch_first=True)
-        self.ffn_norm = nn.LayerNorm(token_dim)
-        self.ffn = FeedForward(token_dim, mlp_ratio)
-        self.gate = nn.Linear(token_dim * 2, token_dim)
+        self.query = nn.Parameter(torch.empty(1, target_tokens, config.token_dim))
+        self.norm = nn.LayerNorm(config.token_dim)
+        self.attention = nn.MultiheadAttention(
+            config.token_dim, config.num_heads, dropout=config.dropout, batch_first=True
+        )
+        nn.init.trunc_normal_(self.query, std=0.02)
+
+    def forward(self, tokens: Tensor) -> Tensor:
+        query = self.query.expand(tokens.shape[0], -1, -1)
+        normalized = self.norm(tokens)
+        result, _ = self.attention(query, normalized, normalized, need_weights=False)
+        return result
+
+
+class CausalVisualEncoder(nn.Module):
+    """Compress K raw frames to one fixed-size spatial-token step."""
+
+    def __init__(self, config: SynchronousControlConfig) -> None:
+        super().__init__()
+        dim = config.token_dim
+        self.config = config
+        self.backbone = nn.Sequential(
+            nn.Conv2d(config.input_channels, dim // 4, 5, stride=2, padding=2),
+            nn.GroupNorm(4, dim // 4), nn.GELU(),
+            nn.Conv2d(dim // 4, dim // 2, 3, stride=2, padding=1),
+            nn.GroupNorm(8, dim // 2), nn.GELU(),
+            nn.Conv2d(dim // 2, dim, 3, stride=2, padding=1),
+            nn.GroupNorm(8, dim), nn.GELU(),
+        )
+        token_count = config.spatial_grid**2
+        self.spatial_position = nn.Parameter(torch.empty(1, 1, token_count, dim))
+        self.group_position = nn.Parameter(
+            torch.empty(1, config.frames_per_step, 1, dim)
+        )
+        self.group_query = nn.Parameter(torch.empty(1, token_count, dim))
+        self.group_attention = nn.MultiheadAttention(
+            dim, config.num_heads, dropout=config.dropout, batch_first=True
+        )
+        self.output_norm = nn.LayerNorm(dim)
+        for parameter in (self.spatial_position, self.group_position, self.group_query):
+            nn.init.trunc_normal_(parameter, std=0.02)
+
+    def forward(self, video: Tensor) -> Tensor:
+        if video.ndim != 5:
+            raise ValueError(f"Expected video [B,T,C,H,W], got {tuple(video.shape)}")
+        batch, raw_time, channels, height, width = video.shape
+        group = self.config.frames_per_step
+        if channels != self.config.input_channels:
+            raise ValueError(f"Expected {self.config.input_channels} channels, got {channels}")
+        if raw_time == 0 or raw_time % group:
+            raise ValueError("Encoder input must contain complete frame groups")
+
+        features = self.backbone(video.reshape(batch * raw_time, channels, height, width))
+        grid = self.config.spatial_grid
+        features = F.adaptive_avg_pool2d(features, (grid, grid))
+        tokens = features.flatten(2).transpose(1, 2)
+        tokens = tokens.reshape(batch, raw_time, grid * grid, -1) + self.spatial_position
+        internal_time = raw_time // group
+        tokens = tokens.reshape(batch, internal_time, group, grid * grid, -1)
+        tokens = tokens + self.group_position.unsqueeze(1)
+        source = tokens.flatten(2, 3).reshape(batch * internal_time, group * grid * grid, -1)
+        query = self.group_query.expand(batch * internal_time, -1, -1)
+        encoded, _ = self.group_attention(query, source, source, need_weights=False)
+        encoded = self.output_norm(encoded)
+        return encoded.reshape(batch, internal_time, grid * grid, -1)
+
+
+class PerceptionFusion(nn.Module):
+    """Append optional synchronous vector sensors as an additional token."""
+
+    def __init__(self, config: SynchronousControlConfig) -> None:
+        super().__init__()
+        self.config = config
+        if config.auxiliary_features:
+            self.auxiliary_encoder = nn.Sequential(
+                nn.LayerNorm(config.auxiliary_features),
+                nn.Linear(config.auxiliary_features, config.token_dim),
+                nn.GELU(), nn.Linear(config.token_dim, config.token_dim),
+                nn.LayerNorm(config.token_dim),
+            )
+
+    def forward(self, visual: Tensor, auxiliary: Tensor | None) -> Tensor:
+        if not self.config.auxiliary_features:
+            if auxiliary is not None:
+                raise ValueError("Model was configured without auxiliary features")
+            return visual
+        if auxiliary is None:
+            raise ValueError("Auxiliary sensor input is required")
+        if auxiliary.shape[:2] != visual.shape[:2] or auxiliary.shape[-1] != self.config.auxiliary_features:
+            raise ValueError(
+                f"Expected grouped auxiliary [B,T,{self.config.auxiliary_features}], "
+                f"got {tuple(auxiliary.shape)}"
+            )
+        token = self.auxiliary_encoder(auxiliary).unsqueeze(2)
+        return torch.cat([visual, token], dim=2)
+
+
+class TokenLayer(nn.Module):
+    """Fuse incoming tokens with the current layer, then self-attend."""
+
+    def __init__(self, config: SynchronousControlConfig) -> None:
+        super().__init__()
+        dim = config.token_dim
+        self.state_norm = nn.LayerNorm(dim)
+        self.input_norm = nn.LayerNorm(dim)
+        self.cross_attention = nn.MultiheadAttention(
+            dim, config.num_heads, dropout=config.dropout, batch_first=True
+        )
+        self.self_norm = nn.LayerNorm(dim)
+        self.self_attention = nn.MultiheadAttention(
+            dim, config.num_heads, dropout=config.dropout, batch_first=True
+        )
+        self.ffn_norm = nn.LayerNorm(dim)
+        self.ffn = FeedForward(dim, config.mlp_ratio, config.dropout)
+        self.gate = nn.Linear(dim * 2, dim)
 
     def forward(self, state: Tensor, incoming: Tensor) -> Tensor:
-        incoming = self.resampler(incoming)
-        state_norm = self.state_norm(state)
-        incoming_norm = self.incoming_norm(incoming)
-
-        candidate, _ = self.cross_attn(
-            query=state_norm,
-            key=incoming_norm,
-            value=incoming_norm,
+        update, _ = self.cross_attention(
+            self.state_norm(state), self.input_norm(incoming), self.input_norm(incoming),
             need_weights=False,
         )
-        candidate = state + candidate
-
-        self_context, _ = self.self_attn(
-            query=self.self_norm(candidate),
-            key=self.self_norm(candidate),
-            value=self.self_norm(candidate),
-            need_weights=False,
-        )
-        candidate = candidate + self_context
+        candidate = state + update
+        normalized = self.self_norm(candidate)
+        context, _ = self.self_attention(normalized, normalized, normalized, need_weights=False)
+        candidate = candidate + context
         candidate = candidate + self.ffn(self.ffn_norm(candidate))
-
         gate = torch.sigmoid(self.gate(torch.cat([state, candidate], dim=-1)))
         return gate * candidate + (1.0 - gate) * state
 
 
-class HierarchicalMemoryPipeline(nn.Module):
-    """Persistent state machine with variable-capacity token layers."""
+class TokenPipelineMemory(nn.Module):
+    """Temporal shift pipeline: old layer i moves into layer i+1."""
 
-    def __init__(self, config: NeuralStreamProcessorConfig) -> None:
+    def __init__(self, config: SynchronousControlConfig) -> None:
         super().__init__()
         self.config = config
         self.initial_states = nn.ParameterList(
-            [
-                nn.Parameter(torch.zeros(1, count, config.token_dim))
-                for count in config.state_tokens
-            ]
+            [nn.Parameter(torch.empty(1, count, config.token_dim)) for count in config.state_tokens]
         )
-        self.layers = nn.ModuleList(
-            [
-                StateFusionBlock(
-                    state_tokens=count,
-                    token_dim=config.token_dim,
-                    num_heads=config.num_heads,
-                    mlp_ratio=config.mlp_ratio,
-                )
-                for count in config.state_tokens
-            ]
+        self.layers = nn.ModuleList([TokenLayer(config) for _ in config.state_tokens])
+        self.transfers = nn.ModuleList(
+            [TokenResampler(config.state_tokens[index], config) for index in range(1, len(config.state_tokens))]
         )
-        # Read from every memory scale. Shallow layers retain recent detail while
-        # larger/deeper layers provide a slower, higher-capacity context.
-        self.readout_query = nn.Parameter(
-            torch.empty(1, config.encoder_tokens, config.token_dim)
+        self.readout_query = nn.Parameter(torch.empty(1, 1, config.token_dim))
+        self.readout_attention = nn.MultiheadAttention(
+            config.token_dim, config.num_heads, dropout=config.dropout, batch_first=True
         )
-        self.readout_norms = nn.ModuleList(
-            [nn.LayerNorm(config.token_dim) for _ in config.state_tokens]
-        )
-        self.readout_attn = nn.MultiheadAttention(
-            config.token_dim, config.num_heads, batch_first=True
-        )
-        self.readout_output_norm = nn.LayerNorm(config.token_dim)
+        self.readout_norm = nn.LayerNorm(config.token_dim)
+        for state in self.initial_states:
+            nn.init.trunc_normal_(state, std=0.02)
         nn.init.trunc_normal_(self.readout_query, std=0.02)
 
-    def init_state(self, batch_size: int, device: torch.device | None = None) -> list[Tensor]:
-        """Create a fresh recurrent state list for a batch."""
-        states: list[Tensor] = []
-        for initial in self.initial_states:
-            base = initial if device is None else initial.to(device)
-            states.append(base.expand(batch_size, -1, -1).clone())
-        return states
-
-    def forward(
-        self,
-        encoded: Tensor,
-        states: list[Tensor] | None = None,
-    ) -> tuple[Tensor, list[Tensor]]:
-        """Advance the memory pipeline by one encoded time step."""
-        if states is None:
-            states = self.init_state(encoded.shape[0], encoded.device)
-        if len(states) != len(self.layers):
-            raise ValueError(f"Expected {len(self.layers)} states, got {len(states)}")
-
-        incoming = encoded
-        new_states: list[Tensor] = []
-        for layer, state in zip(self.layers, states):
-            updated = layer(state, incoming)
-            new_states.append(updated)
-            incoming = updated
-        memory_bank = torch.cat(
-            [norm(state) for norm, state in zip(self.readout_norms, new_states)], dim=1
+    def init_state(self, batch: int, device: torch.device) -> ControlState:
+        return ControlState(
+            tuple(state.expand(batch, -1, -1).clone().to(device) for state in self.initial_states)
         )
-        query = self.readout_query.expand(encoded.shape[0], -1, -1)
-        readout, _ = self.readout_attn(
-            query=query, key=memory_bank, value=memory_bank, need_weights=False
+
+    def forward_step(self, perception: Tensor, state: ControlState) -> tuple[Tensor, ControlState]:
+        if len(state.layers) != len(self.layers):
+            raise ValueError(f"Expected {len(self.layers)} token layers, got {len(state.layers)}")
+        # Every incoming value is derived from the same previous-step snapshot.
+        incoming = [perception]
+        incoming.extend(
+            transfer(state.layers[index]) for index, transfer in enumerate(self.transfers)
         )
-        return self.readout_output_norm(readout), new_states
+        new_layers = tuple(
+            layer(old_layer, layer_input)
+            for layer, old_layer, layer_input in zip(self.layers, state.layers, incoming)
+        )
+        bank = torch.cat([perception, *new_layers], dim=1)
+        query = self.readout_query.expand(perception.shape[0], -1, -1)
+        readout, _ = self.readout_attention(query, bank, bank, need_weights=False)
+        return self.readout_norm(readout[:, 0]), ControlState(new_layers, state.step + 1)
 
 
-class StreamDecoder(nn.Module):
-    """Decodes a token grid back to one output frame."""
-
-    def __init__(self, config: NeuralStreamProcessorConfig) -> None:
+class ResponseDecoder(nn.Module):
+    def __init__(self, config: SynchronousControlConfig) -> None:
         super().__init__()
-        self.config = config
-        self.readout = TokenResampler(config.encoder_tokens, config.token_dim, config.num_heads)
-        dim = config.token_dim
+        self.activation = config.response_activation
         self.net = nn.Sequential(
-            nn.ConvTranspose2d(dim, dim // 2, kernel_size=4, stride=2, padding=1),
-            nn.GELU(),
-            nn.ConvTranspose2d(dim // 2, dim // 4, kernel_size=4, stride=2, padding=1),
-            nn.GELU(),
-            nn.ConvTranspose2d(dim // 4, config.output_channels, kernel_size=4, stride=2, padding=1),
-            nn.Sigmoid(),
+            nn.LayerNorm(config.token_dim),
+            nn.Linear(config.token_dim, config.token_dim * 2), nn.GELU(),
+            nn.Dropout(config.dropout),
+            nn.Linear(config.token_dim * 2, config.response_dim),
         )
 
-    def forward(self, tokens: Tensor) -> Tensor:
-        tokens = self.readout(tokens)
-        bsz = tokens.shape[0]
-        grid = self.config.encoder_grid
-        x = tokens.transpose(1, 2).reshape(bsz, self.config.token_dim, grid, grid)
-        frame = self.net(x)
-        if frame.shape[-1] != self.config.image_size:
-            frame = F.interpolate(
-                frame,
-                size=(self.config.image_size, self.config.image_size),
-                mode="bilinear",
-                align_corners=False,
-            )
-        return frame
+    def forward(self, token: Tensor) -> Tensor:
+        response = self.net(token)
+        return torch.tanh(response) if self.activation == "tanh" else response
 
 
-class NeuralStreamProcessor(nn.Module):
-    """End-to-end small stream processor for video next-frame prediction."""
+class SynchronousControlProcessor(nn.Module):
+    """Fixed-rate causal processor for synchronous response/control signals."""
 
-    def __init__(self, config: NeuralStreamProcessorConfig | None = None) -> None:
+    def __init__(self, config: SynchronousControlConfig | None = None) -> None:
         super().__init__()
-        self.config = config or NeuralStreamProcessorConfig()
-        self.encoder = StreamEncoder(self.config)
-        self.memory = HierarchicalMemoryPipeline(self.config)
-        self.decoder = StreamDecoder(self.config)
+        self.config = config or SynchronousControlConfig()
+        self.encoder = CausalVisualEncoder(self.config)
+        self.fusion = PerceptionFusion(self.config)
+        self.memory = TokenPipelineMemory(self.config)
+        self.decoder = ResponseDecoder(self.config)
 
-    def forward_step(
+    def _join_pending(
+        self, video: Tensor, auxiliary: Tensor | None, state: ControlState
+    ) -> tuple[Tensor, Tensor | None]:
+        if state.pending_video is not None:
+            video = torch.cat([state.pending_video, video], dim=1)
+        if self.config.auxiliary_features:
+            if auxiliary is None:
+                raise ValueError("Auxiliary sensor input is required")
+            if state.pending_auxiliary is not None:
+                auxiliary = torch.cat([state.pending_auxiliary, auxiliary], dim=1)
+        return video, auxiliary
+
+    def forward_chunk(
         self,
-        chunk: Tensor,
-        states: list[Tensor] | None = None,
-    ) -> tuple[Tensor, list[Tensor]]:
-        """Process one chunk and predict one output frame."""
-        encoded = self.encoder(chunk)
-        readout, new_states = self.memory(encoded, states)
-        frame = self.decoder(readout)
-        return frame, new_states
+        video: Tensor,
+        auxiliary: Tensor | None = None,
+        state: ControlState | None = None,
+    ) -> tuple[Tensor, ControlState]:
+        if video.ndim != 5 or video.shape[1] == 0:
+            raise ValueError("video must be non-empty [B,T,C,H,W]")
+        if state is None:
+            state = self.memory.init_state(video.shape[0], video.device)
+        video, auxiliary = self._join_pending(video, auxiliary, state)
+        group = self.config.frames_per_step
+        complete = (video.shape[1] // group) * group
+        pending_video = video[:, complete:]
+        pending_auxiliary = None if auxiliary is None else auxiliary[:, complete:]
 
-    def forward(self, video: Tensor) -> Tensor:
-        """Process a whole video sequence chunk-by-chunk.
+        if complete == 0:
+            empty = video.new_empty((video.shape[0], 0, self.config.response_dim))
+            return empty, ControlState(state.layers, state.step, pending_video, pending_auxiliary)
 
-        Args:
-            video: Tensor shaped [batch, time, channels, height, width].
+        grouped_video = video[:, :complete]
+        visual = self.encoder(grouped_video)
+        grouped_auxiliary = None
+        if auxiliary is not None:
+            raw_auxiliary = auxiliary[:, :complete]
+            grouped_auxiliary = raw_auxiliary.reshape(
+                raw_auxiliary.shape[0], -1, group, raw_auxiliary.shape[-1]
+            ).mean(dim=2)
+        perceptions = self.fusion(visual, grouped_auxiliary)
 
-        Returns:
-            Tensor shaped [batch, output_steps, channels, height, width].
-        """
-        if video.ndim != 5:
-            raise ValueError(f"Expected [B, T, C, H, W], got {tuple(video.shape)}")
-        chunk = self.config.chunk_size
-        if video.shape[1] < chunk:
-            raise ValueError(f"Video needs at least {chunk} frames")
-
-        states: list[Tensor] | None = None
         outputs: list[Tensor] = []
-        for start in range(0, video.shape[1] - chunk + 1):
-            frame, states = self.forward_step(video[:, start : start + chunk], states)
-            outputs.append(frame)
-        return torch.stack(outputs, dim=1)
+        running = ControlState(state.layers, state.step)
+        for timestep in range(perceptions.shape[1]):
+            readout, running = self.memory.forward_step(perceptions[:, timestep], running)
+            outputs.append(self.decoder(readout))
+        next_state = ControlState(
+            running.layers, running.step, pending_video, pending_auxiliary
+        )
+        return torch.stack(outputs, dim=1), next_state
+
+    def forward(self, video: Tensor, auxiliary: Tensor | None = None) -> Tensor:
+        responses, state = self.forward_chunk(video, auxiliary)
+        if state.pending_video is not None and state.pending_video.shape[1]:
+            raise ValueError("Full forward input length must be divisible by frames_per_step")
+        return responses
