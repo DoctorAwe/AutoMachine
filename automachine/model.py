@@ -32,6 +32,14 @@ class NeuralStreamProcessorConfig:
     mlp_ratio: int = 4
     output_channels: int = 3
 
+    def __post_init__(self) -> None:
+        if self.image_size <= 0 or self.chunk_size <= 0 or self.encoder_grid <= 0:
+            raise ValueError("image_size, chunk_size and encoder_grid must be positive")
+        if self.token_dim <= 0 or self.num_heads <= 0 or self.token_dim % self.num_heads:
+            raise ValueError("token_dim must be positive and divisible by num_heads")
+        if not self.state_tokens or any(count <= 0 for count in self.state_tokens):
+            raise ValueError("state_tokens must contain positive token counts")
+
     @property
     def encoder_tokens(self) -> int:
         return self.encoder_grid * self.encoder_grid
@@ -42,18 +50,38 @@ class StreamEncoder(nn.Module):
 
     def __init__(self, config: NeuralStreamProcessorConfig) -> None:
         super().__init__()
-        in_channels = config.input_channels * config.chunk_size
         dim = config.token_dim
         self.config = config
+        # Keep time as an explicit dimension.  The former implementation folded
+        # frames into channels, which made frame order unnecessarily hard to learn.
         self.net = nn.Sequential(
-            nn.Conv2d(in_channels, dim // 2, kernel_size=5, stride=2, padding=2),
+            nn.Conv3d(
+                config.input_channels,
+                dim // 2,
+                kernel_size=(3, 5, 5),
+                stride=(1, 2, 2),
+                padding=(1, 2, 2),
+            ),
             nn.GELU(),
-            nn.Conv2d(dim // 2, dim, kernel_size=3, stride=2, padding=1),
+            nn.Conv3d(
+                dim // 2,
+                dim,
+                kernel_size=(3, 3, 3),
+                stride=(1, 2, 2),
+                padding=1,
+            ),
             nn.GELU(),
-            nn.Conv2d(dim, dim, kernel_size=3, stride=2, padding=1),
+            nn.Conv3d(
+                dim,
+                dim,
+                kernel_size=(3, 3, 3),
+                stride=(1, 2, 2),
+                padding=1,
+            ),
             nn.GELU(),
         )
         self.proj = nn.Conv2d(dim, dim, kernel_size=1)
+        self.temporal_score = nn.Conv3d(dim, 1, kernel_size=1)
         self.pos = nn.Parameter(torch.zeros(1, config.encoder_tokens, dim))
         nn.init.trunc_normal_(self.pos, std=0.02)
 
@@ -74,8 +102,11 @@ class StreamEncoder(nn.Module):
                 f"{expected.input_channels}, H, W], got {tuple(chunk.shape)}"
             )
 
-        x = chunk.reshape(bsz, steps * channels, height, width)
-        x = self.proj(self.net(x))
+        x = self.net(chunk.transpose(1, 2))
+        # Content-dependent causal-chunk pooling preserves ordering information
+        # while still producing a fixed-rate token grid.
+        weights = self.temporal_score(x).mean(dim=(-1, -2), keepdim=True).softmax(dim=2)
+        x = self.proj((x * weights).sum(dim=2))
         if x.shape[-2:] != (expected.encoder_grid, expected.encoder_grid):
             x = F.adaptive_avg_pool2d(x, (expected.encoder_grid, expected.encoder_grid))
         x = x.flatten(2).transpose(1, 2)
@@ -185,6 +216,19 @@ class HierarchicalMemoryPipeline(nn.Module):
                 for count in config.state_tokens
             ]
         )
+        # Read from every memory scale. Shallow layers retain recent detail while
+        # larger/deeper layers provide a slower, higher-capacity context.
+        self.readout_query = nn.Parameter(
+            torch.empty(1, config.encoder_tokens, config.token_dim)
+        )
+        self.readout_norms = nn.ModuleList(
+            [nn.LayerNorm(config.token_dim) for _ in config.state_tokens]
+        )
+        self.readout_attn = nn.MultiheadAttention(
+            config.token_dim, config.num_heads, batch_first=True
+        )
+        self.readout_output_norm = nn.LayerNorm(config.token_dim)
+        nn.init.trunc_normal_(self.readout_query, std=0.02)
 
     def init_state(self, batch_size: int, device: torch.device | None = None) -> list[Tensor]:
         """Create a fresh recurrent state list for a batch."""
@@ -211,7 +255,14 @@ class HierarchicalMemoryPipeline(nn.Module):
             updated = layer(state, incoming)
             new_states.append(updated)
             incoming = updated
-        return incoming, new_states
+        memory_bank = torch.cat(
+            [norm(state) for norm, state in zip(self.readout_norms, new_states)], dim=1
+        )
+        query = self.readout_query.expand(encoded.shape[0], -1, -1)
+        readout, _ = self.readout_attn(
+            query=query, key=memory_bank, value=memory_bank, need_weights=False
+        )
+        return self.readout_output_norm(readout), new_states
 
 
 class StreamDecoder(nn.Module):

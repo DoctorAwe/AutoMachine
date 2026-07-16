@@ -102,3 +102,5 @@ python -m automachine.train --steps 1000 --batch-size 8 --token-dim 96 --device 
 1. 动物运动视频或姿态序列，做下一帧/下一步预测。
 2. 肌电、脑电、神经 spike train 等真实时域信号，做后续波形预测。
 3. 输入视频或传感器流，输出控制信号流。
+
+数据集候选和接入顺序见 `DATASETS.md`。
