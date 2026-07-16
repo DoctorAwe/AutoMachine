@@ -67,7 +67,12 @@ python -m tests.smoke_forward
 python -m automachine.train --steps 200 --device auto
 ```
 
-真实生物响应任务使用 ActionSense 的第一视角视频到双臂 16 通道 EMG，数据准备见 [ACTIONSENSE.md](ACTIONSENSE.md)。
+真实生物响应任务使用 ActionSense 的第一视角视频到双臂 16 通道 EMG，完整 Colab 下载、处理和训练步骤见 [ACTIONSENSE.md](ACTIONSENSE.md)。对应入口：
+
+```bash
+python -m automachine.prepare_actionsense --help
+python -m automachine.train_actionsense --help
+```
 
 ## 输出安全边界
 
