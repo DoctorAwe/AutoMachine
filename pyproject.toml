@@ -1,0 +1,18 @@
+[project]
+name = "automachine"
+version = "0.1.0"
+description = "Hierarchical streaming transformer prototype for temporal signal input/output."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "torch>=2.3",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py", "*_test.py"]
