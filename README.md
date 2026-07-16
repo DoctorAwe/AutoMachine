@@ -42,3 +42,18 @@ python -m automachine.train_features --data data\uci_har\train.npz --input-lengt
 ```
 
 转换器沿用官方按受试者划分的 train/test 集，并且只用训练集统计量标准化，避免数据泄漏。更多候选见 [DATASETS.md](DATASETS.md)。云端训练步骤见 [CLOUD_TRAINING.md](CLOUD_TRAINING.md)。
+
+## Colab 在线预测展示
+
+把训练 checkpoint 放在 `checkpoints/`，安装展示依赖并启动：
+
+```bash
+pip install -r requirements-demo.txt
+python -m automachine.demo \
+  --data data/uci_har/test.npz \
+  --checkpoints checkpoints \
+  --device auto \
+  --share
+```
+
+终端会输出一个临时 `gradio.live` 公网地址。页面可以切换多个 checkpoint 和测试样本，对比九通道输入、真实后续信号、模型预测及“复制上一采样点”基线。

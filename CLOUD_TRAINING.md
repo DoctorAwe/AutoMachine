@@ -7,7 +7,7 @@
 任选一种方式：
 
 ```bash
-git clone <your-repo-url> AutoMachine
+git clone https://github.com/DoctorAwe/AutoMachine
 cd AutoMachine
 ```
 
