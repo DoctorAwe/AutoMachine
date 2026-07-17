@@ -2,7 +2,12 @@ from __future__ import annotations
 
 import torch
 
-from automachine import SynchronousControlConfig, SynchronousControlProcessor
+from automachine import DEFAULT_STATE_TOKENS, SynchronousControlConfig, SynchronousControlProcessor
+
+
+def test_default_pipeline_has_sixteen_stages_and_growing_tail() -> None:
+    assert len(DEFAULT_STATE_TOKENS) == 16
+    assert DEFAULT_STATE_TOKENS[-1] > DEFAULT_STATE_TOKENS[0]
 
 
 def small_config(**overrides) -> SynchronousControlConfig:

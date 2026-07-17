@@ -3,6 +3,7 @@
 ## 安装与验证
 
 ```bash
+git clone https://github.com/DoctorAwe/AutoMachine
 cd /content/AutoMachine
 python -m pip install -r requirements.txt
 python -m tests.smoke_forward

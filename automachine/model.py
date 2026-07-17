@@ -15,6 +15,17 @@ from torch import Tensor, nn
 import torch.nn.functional as F
 
 
+# Sixteen causal stages give the pipeline sixteen encoded-time steps of direct
+# propagation history.  The tail grows wider to provide higher-capacity,
+# slower-changing state without making every early stage expensive.
+DEFAULT_STATE_TOKENS = (
+    16, 16, 16, 16, 16, 16, 16, 16,
+    24, 24, 24, 24,
+    32, 32,
+    48, 64,
+)
+
+
 @dataclass(frozen=True)
 class SynchronousControlConfig:
     image_size: int = 96
@@ -24,7 +35,7 @@ class SynchronousControlConfig:
     frames_per_step: int = 1
     token_dim: int = 64
     spatial_grid: int = 4
-    state_tokens: tuple[int, ...] = (16, 16, 24, 32)
+    state_tokens: tuple[int, ...] = DEFAULT_STATE_TOKENS
     num_heads: int = 4
     mlp_ratio: int = 2
     dropout: float = 0.0

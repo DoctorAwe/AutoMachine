@@ -33,7 +33,8 @@ config = SynchronousControlConfig(
     frames_per_step=1,
     auxiliary_features=0,
     response_dim=16,
-    state_tokens=(16, 16, 24, 32),
+    state_tokens=(16, 16, 16, 16, 16, 16, 16, 16,
+                  24, 24, 24, 24, 32, 32, 48, 64),
 )
 model = SynchronousControlProcessor(config)
 

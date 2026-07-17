@@ -11,7 +11,7 @@ import numpy as np
 import torch
 from torch import nn
 
-from .model import SynchronousControlConfig, SynchronousControlProcessor
+from .model import DEFAULT_STATE_TOKENS, SynchronousControlConfig, SynchronousControlProcessor
 from .train import choose_device
 
 
@@ -164,7 +164,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--token-dim", type=int, default=64)
     parser.add_argument("--spatial-grid", type=int, default=4)
-    parser.add_argument("--state-tokens", type=int, nargs="+", default=[16, 16, 24, 32])
+    parser.add_argument("--state-tokens", type=int, nargs="+", default=list(DEFAULT_STATE_TOKENS))
     parser.add_argument("--num-heads", type=int, default=4)
     parser.add_argument("--dropout", type=float, default=0.05)
     parser.add_argument("--lr", type=float, default=1e-4)
