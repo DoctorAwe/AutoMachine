@@ -92,6 +92,7 @@ def write_shards(
             destination / f"shard_{shard_index:04d}.npz",
             frames=frames.astype(np.float16),
             responses=targets.astype(np.float32),
+            starts=selected.astype(np.int64),
         )
         written += len(selected)
     return written

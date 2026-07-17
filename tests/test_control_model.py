@@ -10,6 +10,29 @@ def test_default_pipeline_has_sixteen_stages_and_growing_tail() -> None:
     assert DEFAULT_STATE_TOKENS[-1] > DEFAULT_STATE_TOKENS[0]
 
 
+def test_default_fusion_prior_prefers_early_strong_updates() -> None:
+    config = SynchronousControlConfig(
+        image_size=16, token_dim=32, spatial_grid=2,
+        state_tokens=(4, 4, 4, 4), num_heads=4,
+    )
+    model = SynchronousControlProcessor(config)
+    early = model.memory.layers[0]
+    late = model.memory.layers[-1]
+    state = torch.zeros(1, 4, 32)
+    candidate = torch.ones_like(state)
+    weak_update = torch.zeros_like(state)
+    strong_update = torch.ones_like(state)
+
+    early_weak = early.fusion_gate(state, candidate, weak_update).mean()
+    early_strong = early.fusion_gate(state, candidate, strong_update).mean()
+    late_strong = late.fusion_gate(state, candidate, strong_update).mean()
+
+    assert early.initial_acceptance > late.initial_acceptance
+    assert early.fusion_threshold < late.fusion_threshold
+    assert early_strong > early_weak
+    assert early_strong > late_strong
+
+
 def small_config(**overrides) -> SynchronousControlConfig:
     values = dict(
         image_size=32,

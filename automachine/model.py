@@ -9,6 +9,7 @@ perception and all layers produces the synchronous response.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 
 import torch
 from torch import Tensor, nn
@@ -40,6 +41,11 @@ class SynchronousControlConfig:
     mlp_ratio: int = 2
     dropout: float = 0.0
     response_activation: str = "none"
+    fusion_acceptance_start: float = 0.95
+    fusion_acceptance_end: float = 0.10
+    fusion_threshold_start: float = 0.05
+    fusion_threshold_end: float = 0.20
+    fusion_temperature: float = 0.025
 
     def __post_init__(self) -> None:
         positive = (
@@ -59,6 +65,18 @@ class SynchronousControlConfig:
             raise ValueError("dropout must be in [0, 1)")
         if self.response_activation not in {"none", "tanh"}:
             raise ValueError("response_activation must be 'none' or 'tanh'")
+        if not 0.0 < self.fusion_acceptance_start < 1.0:
+            raise ValueError("fusion_acceptance_start must be between 0 and 1")
+        if not 0.0 < self.fusion_acceptance_end < 1.0:
+            raise ValueError("fusion_acceptance_end must be between 0 and 1")
+        if self.fusion_acceptance_start < self.fusion_acceptance_end:
+            raise ValueError("fusion acceptance must not increase with pipeline depth")
+        if self.fusion_threshold_start < 0.0 or self.fusion_threshold_end < 0.0:
+            raise ValueError("fusion thresholds cannot be negative")
+        if self.fusion_threshold_start > self.fusion_threshold_end:
+            raise ValueError("fusion threshold must not decrease with pipeline depth")
+        if self.fusion_temperature <= 0.0:
+            raise ValueError("fusion_temperature must be positive")
 
 
 @dataclass
@@ -196,9 +214,19 @@ class PerceptionFusion(nn.Module):
 class TokenLayer(nn.Module):
     """Fuse incoming tokens with the current layer, then self-attend."""
 
-    def __init__(self, config: SynchronousControlConfig) -> None:
+    def __init__(self, config: SynchronousControlConfig, depth_index: int, depth_count: int) -> None:
         super().__init__()
         dim = config.token_dim
+        self.depth_fraction = depth_index / max(depth_count - 1, 1)
+        self.initial_acceptance = (
+            config.fusion_acceptance_start * (1.0 - self.depth_fraction)
+            + config.fusion_acceptance_end * self.depth_fraction
+        )
+        self.fusion_threshold = (
+            config.fusion_threshold_start * (1.0 - self.depth_fraction)
+            + config.fusion_threshold_end * self.depth_fraction
+        )
+        self.fusion_temperature = config.fusion_temperature
         self.state_norm = nn.LayerNorm(dim)
         self.input_norm = nn.LayerNorm(dim)
         self.cross_attention = nn.MultiheadAttention(
@@ -211,6 +239,24 @@ class TokenLayer(nn.Module):
         self.ffn_norm = nn.LayerNorm(dim)
         self.ffn = FeedForward(dim, config.mlp_ratio, config.dropout)
         self.gate = nn.Linear(dim * 2, dim)
+        # The depth prior is only an initialization. The learned gate can move
+        # away from it during training when the data supports another policy.
+        nn.init.zeros_(self.gate.weight)
+        nn.init.constant_(
+            self.gate.bias,
+            math.log(self.initial_acceptance / (1.0 - self.initial_acceptance)),
+        )
+
+    def fusion_gate(self, state: Tensor, candidate: Tensor, stimulus_update: Tensor) -> Tensor:
+        learned_gate = torch.sigmoid(self.gate(torch.cat([state, candidate], dim=-1)))
+        # Attention-update RMS is a learned salience measure. Weak proposals
+        # close the gate; sufficiently strong proposals can use the layer's
+        # depth-dependent acceptance capacity.
+        update_strength = torch.sqrt(torch.mean(stimulus_update.float().square(), dim=-1, keepdim=True) + 1e-12)
+        significance = torch.sigmoid(
+            (update_strength - self.fusion_threshold) / self.fusion_temperature
+        ).to(learned_gate.dtype)
+        return learned_gate * significance
 
     def forward(self, state: Tensor, incoming: Tensor) -> Tensor:
         update, _ = self.cross_attention(
@@ -222,7 +268,7 @@ class TokenLayer(nn.Module):
         context, _ = self.self_attention(normalized, normalized, normalized, need_weights=False)
         candidate = candidate + context
         candidate = candidate + self.ffn(self.ffn_norm(candidate))
-        gate = torch.sigmoid(self.gate(torch.cat([state, candidate], dim=-1)))
+        gate = self.fusion_gate(state, candidate, update)
         return gate * candidate + (1.0 - gate) * state
 
 
@@ -235,7 +281,12 @@ class TokenPipelineMemory(nn.Module):
         self.initial_states = nn.ParameterList(
             [nn.Parameter(torch.empty(1, count, config.token_dim)) for count in config.state_tokens]
         )
-        self.layers = nn.ModuleList([TokenLayer(config) for _ in config.state_tokens])
+        self.layers = nn.ModuleList(
+            [
+                TokenLayer(config, index, len(config.state_tokens))
+                for index in range(len(config.state_tokens))
+            ]
+        )
         self.transfers = nn.ModuleList(
             [TokenResampler(config.state_tokens[index], config) for index in range(1, len(config.state_tokens))]
         )
