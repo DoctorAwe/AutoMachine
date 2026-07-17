@@ -1,37 +1,24 @@
 # 同步感知—响应数据集
 
-## 0. Goldin et al. 2022（当前推荐）
+## 0. Li et al. 2025（当前推荐）
 
-小鼠或蝾螈单个视网膜记录：自然视觉刺激与同步神经节细胞 binned response。公开数据可从
-OpenRetina 的 Hugging Face 镜像匿名下载；每个 HDF5 session 可单独训练。详见
-[GOLDIN2022.md](GOLDIN2022.md)。
+4 段连续自然电影和小鼠上丘浅层双光子钙响应；公开下载、单成像平面处理与 Colab 训练见 [LI2025.md](LI2025.md)。它具有共享时间轴，适合检验流式因果状态，而不是把独立图像误当成连续视频。
 
-项目只优先考虑具有共同时间轴的输入与响应/动作数据。
+官方数据：https://zenodo.org/records/14885567
 
 ## 1. ActionSense
 
-真实人类厨房活动：第一视角和环境视频、双臂 EMG、身体姿态、眼动、触觉与活动标签同步。首个任务选择单人 `S04` 的第一视角视频到 16 通道 EMG。详见 [ACTIONSENSE.md](ACTIONSENSE.md)。
+人类厨房活动中的第一视角视频、双臂 EMG、姿态、眼动、触觉和标签。见 [ACTIONSENSE.md](ACTIONSENSE.md)。
 
-官方入口：https://action-sense.csail.mit.edu/data.html
+## 2. Goldin et al. 2022（历史实验）
 
-## 2. LeRobot PushT
+自然图像到视网膜神经节细胞响应。当前公开处理形式中的图像不构成可靠连续电影，因此不用于验证长时间流式因果状态。旧流程见 [GOLDIN2022.md](GOLDIN2022.md)。
 
-约 31.6 MB，包含 96×96 图像、二维状态和同步二维动作。适合在接入大型真实数据之前验证视觉控制映射。
-
-官方入口：https://huggingface.co/datasets/lerobot/pusht_image
-
-## 3. DROID-100
-
-真实机器人多视角视频、机器人状态和 7 维动作。官方提供约 2 GB 的 100-episode 调试子集；完整 RLDS 数据约 1.7 TB。
-
-官方入口：https://droid-dataset.github.io/droid/the-droid-dataset
-
-## 统一任务约定
+## 切分规则
 
 ```text
 observations: [episode, time, modality...]
 responses:    [episode, time, response_dim]
-timestamps:   [episode, time]
 ```
 
-训练、验证和测试必须按完整 episode 切分，不能先切相邻窗口再随机分组。
+训练、验证和测试应按完整 episode/电影切分，窗口不得跨越边界，也不能先生成重叠窗口再随机切分。

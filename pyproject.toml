@@ -16,6 +16,11 @@ dev = [
 goldin2022 = [
     "h5py>=3.11",
 ]
+li2025 = [
+    "opencv-python-headless>=4.9",
+    "scipy>=1.12",
+    "hdf5storage>=0.1.19",
+]
 demo = [
     "gradio>=5.0",
     "plotly>=5.24",
