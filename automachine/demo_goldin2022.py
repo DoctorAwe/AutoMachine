@@ -179,15 +179,21 @@ def build_app(runtime: GoldinDemo) -> gr.Blocks:
     with gr.Blocks(title="AutoMachine · Goldin 2022 流式神经响应") as app:
         gr.Markdown("# AutoMachine · 视觉刺激 → 视网膜响应")
         gr.Markdown(runtime.model_summary())
+        gr.Markdown("拖动时间滑块并松开即可刷新；也可以使用跳转按钮快速浏览前后时间段。")
         with gr.Row():
             split = gr.Dropdown(("validation", "test"), value="validation", label="数据分段")
             start = gr.Slider(0, max(0, maximum_steps - 8), value=0, step=1, label="起始时间点")
             length = gr.Slider(8, min(256, maximum_steps), value=min(64, maximum_steps), step=1, label="展示长度")
         with gr.Row():
+            back_far = gr.Button("← 64")
+            back = gr.Button("← 16")
+            forward = gr.Button("16 →")
+            forward_far = gr.Button("64 →")
+        with gr.Row():
             neuron = gr.Dropdown([str(i) for i in range(runtime.neuron_count)], value="0", label="重点神经元")
             warmup = gr.Slider(0, 256, value=64, step=1, label="流式状态预热步数")
             chunks = gr.Textbox(value="8,16,7,13", label="流式 chunk 序列")
-            run = gr.Button("运行流式演示", variant="primary")
+            run = gr.Button("刷新流式演示", variant="primary")
         with gr.Row():
             frame = gr.Image(label="当前视觉刺激", height=320)
             summary = gr.Markdown()
@@ -198,11 +204,37 @@ def build_app(runtime: GoldinDemo) -> gr.Blocks:
             datatype=("number", "number", "number", "number", "number", "number", "bool"),
             label="逐神经元指标", interactive=False,
         )
-        run.click(
-            runtime.run,
-            inputs=(split, start, length, neuron, warmup, chunks),
-            outputs=(frame, response_plot, population_plot, summary, table),
-        )
+        inputs = (split, start, length, neuron, warmup, chunks)
+        outputs = (frame, response_plot, population_plot, summary, table)
+
+        def refresh(trigger):
+            trigger(runtime.run, inputs=inputs, outputs=outputs)
+
+        refresh(run.click)
+        refresh(start.release)
+        refresh(length.release)
+        refresh(warmup.release)
+        refresh(split.change)
+        refresh(neuron.change)
+        refresh(chunks.submit)
+
+        def shift_time(current, amount):
+            return max(0, min(int(current) + amount, maximum_steps - 8))
+
+        def make_shift(amount):
+            def apply_shift(current):
+                return shift_time(current, amount)
+            return apply_shift
+
+        for button, amount in ((back_far, -64), (back, -16), (forward, 16), (forward_far, 64)):
+            button.click(
+                make_shift(amount),
+                inputs=start,
+                outputs=start,
+                queue=False,
+            ).then(runtime.run, inputs=inputs, outputs=outputs)
+
+        app.load(runtime.run, inputs=inputs, outputs=outputs)
     return app
 
 
