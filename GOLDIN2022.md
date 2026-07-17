@@ -212,11 +212,11 @@ batch 相关再平均，也不会重复计算重叠窗口的时间点。每次�
 !python -m pip install -q -r requirements-demo.txt
 ```
 
-使用新的深度融合 checkpoint：
+使用修复平均值塌缩后的深度融合 v2 checkpoint：
 
 ```bash
 !python -m automachine.demo_goldin2022 \
-  --checkpoint checkpoints/goldin2022_depth_fusion_v1.pt \
+  --checkpoint checkpoints/goldin2022_depth_fusion_v2.pt \
   --data data/goldin2022/processed \
   --device cuda \
   --share

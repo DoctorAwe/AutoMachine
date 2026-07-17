@@ -208,7 +208,7 @@ def build_app(runtime: GoldinDemo) -> gr.Blocks:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Launch the Goldin 2022 streaming Gradio demo")
-    parser.add_argument("--checkpoint", type=Path, default=Path("checkpoints/goldin2022_depth_fusion_v1.pt"))
+    parser.add_argument("--checkpoint", type=Path, default=Path("checkpoints/goldin2022_depth_fusion_v2.pt"))
     parser.add_argument("--data", type=Path, default=Path("data/goldin2022/processed"))
     parser.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
     parser.add_argument("--host", default="0.0.0.0")
