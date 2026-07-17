@@ -1,5 +1,11 @@
 # 同步感知—响应数据集
 
+## 0. Goldin et al. 2022（当前推荐）
+
+小鼠或蝾螈单个视网膜记录：自然视觉刺激与同步神经节细胞 binned response。公开数据可从
+OpenRetina 的 Hugging Face 镜像匿名下载；每个 HDF5 session 可单独训练。详见
+[GOLDIN2022.md](GOLDIN2022.md)。
+
 项目只优先考虑具有共同时间轴的输入与响应/动作数据。
 
 ## 1. ActionSense

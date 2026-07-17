@@ -1,5 +1,8 @@
 # AutoMachine / 同步神经处理机
 
+当前推荐的真实生物响应任务是 Goldin et al. 2022 单视网膜自然视觉刺激到神经节细胞响应，
+下载、转换和 Colab 训练见 [GOLDIN2022.md](GOLDIN2022.md)。
+
 AutoMachine 是一个面向连续感知与控制的因果流式模型：
 
 ```text

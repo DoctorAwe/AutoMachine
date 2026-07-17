@@ -13,6 +13,9 @@ dependencies = [
 dev = [
     "pytest>=8.0",
 ]
+goldin2022 = [
+    "h5py>=3.11",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
