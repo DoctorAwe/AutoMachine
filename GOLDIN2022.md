@@ -232,3 +232,40 @@ Colab 输出中会出现一个 Gradio 公网地址。打开后可以：
 - 同时检查未来扰动因果误差与整段/流式一致性误差。
 
 演示会读取 checkpoint 内保存的模型配置，不会用当前代码默认值覆盖已经训练的 16 层深度融合模型。
+
+## 8. 修复平均值直线输出
+
+如果模型曲线与均值基线几乎重合，说明普通 Poisson 在稀疏响应上收敛到了平均 firing rate。
+新版训练目标为：
+
+```text
+总损失 = 非零事件加权 Poisson
+       + 0.25 × 逐神经元时间相关损失
+       + 0.05 × 相邻响应差分损失
+```
+
+可以从深度融合 checkpoint 继续纠正，并保存为新文件：
+
+```bash
+!python -m automachine.train_goldin2022 \
+  --data data/goldin2022/processed \
+  --steps 4000 \
+  --batch-size 4 \
+  --lr 5e-5 \
+  --correlation-weight 0.25 \
+  --delta-weight 0.05 \
+  --event-weight 1.0 \
+  --device cuda \
+  --resume checkpoints/goldin2022_depth_fusion_v1.pt \
+  --checkpoint checkpoints/goldin2022_depth_fusion_v2.pt
+```
+
+`--steps` 是总步数，不是追加步数；如果原 checkpoint 已到 3000，上述命令会继续训练到 4000。
+新版日志会分别报告 `poisson`、`corr_loss` 和 `delta_loss`。评估新增：
+
+```text
+modulation             逐神经元 prediction_std / target_std 的中位数
+neurons_modulated      modulation ratio > 0.1 的神经元比例
+```
+
+修复有效时，`response_r_mean` 应上升、`modulation` 应离开零，同时 Poisson 不应长期显著差于基线。

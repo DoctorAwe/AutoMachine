@@ -62,7 +62,11 @@ class GoldinDemo:
         return int(self.config.response_dim)
 
     def model_summary(self) -> str:
-        mode = getattr(self.config, "fusion_mode", "legacy")
+        mode = getattr(
+            self.config,
+            "fusion_mode",
+            "depth_sensitive" if hasattr(self.config, "fusion_acceptance_start") else "legacy",
+        )
         return (
             f"**Checkpoint:** `{self.checkpoint_path.name}` · **step:** {self.step} · "
             f"**device:** `{self.device}` · **neurons:** {self.neuron_count} · "
@@ -98,6 +102,9 @@ class GoldinDemo:
             torch.log(baseline_rate.clamp_min(1e-6)), target,
             log_input=True, full=False, reduction="none",
         ).mean(dim=(0, 1))
+        target_std = target.std(dim=(0, 1), unbiased=False)
+        prediction_std = rate.std(dim=(0, 1), unbiased=False)
+        modulation_ratio = prediction_std / target_std.clamp_min(1e-8)
 
         cutoff = max(1, video.shape[1] - length // 2)
         perturbed = video.clone()
@@ -144,6 +151,8 @@ class GoldinDemo:
             f"- response r：均值 `{finite_r.mean().item() if len(finite_r) else float('nan'):.4f}`，"
             f"正相关 `{((finite_r > 0).float().mean().item() if len(finite_r) else float('nan')):.1%}`\n"
             f"- delta r：均值 `{finite_delta.mean().item() if len(finite_delta) else float('nan'):.4f}`\n"
+            f"- modulation ratio：中位数 `{modulation_ratio.median().item():.4f}`，"
+            f"超过 0.1 的神经元 `{(modulation_ratio > 0.1).float().mean().item():.1%}`\n"
             f"- 改善神经元：`{(model_nll < baseline_nll).float().mean().item():.1%}`\n"
             f"- 因果误差：`{causal_max:.3e}`；流式一致性误差：`{stream_max:.3e}`"
         )
@@ -154,6 +163,7 @@ class GoldinDemo:
                 float(delta_r[index].cpu()),
                 float(model_nll[index].cpu()),
                 float(baseline_nll[index].cpu()),
+                float(modulation_ratio[index].cpu()),
                 bool(model_nll[index] < baseline_nll[index]),
             ]
             for index in range(self.neuron_count)
@@ -184,8 +194,8 @@ def build_app(runtime: GoldinDemo) -> gr.Blocks:
         response_plot = gr.Plot(label="选定神经元响应")
         population_plot = gr.Plot(label="全神经元时间响应")
         table = gr.Dataframe(
-            headers=("neuron", "response_r", "delta_r", "model_nll", "baseline_nll", "improved"),
-            datatype=("number", "number", "number", "number", "number", "bool"),
+            headers=("neuron", "response_r", "delta_r", "model_nll", "baseline_nll", "modulation", "improved"),
+            datatype=("number", "number", "number", "number", "number", "number", "bool"),
             label="逐神经元指标", interactive=False,
         )
         run.click(

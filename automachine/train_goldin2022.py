@@ -39,6 +39,42 @@ def poisson_loss(log_rate: torch.Tensor, response: torch.Tensor) -> torch.Tensor
     return F.poisson_nll_loss(log_rate, response, log_input=True, full=False)
 
 
+def weighted_poisson_loss(
+    log_rate: torch.Tensor, response: torch.Tensor, event_weight: float
+) -> torch.Tensor:
+    element_loss = F.poisson_nll_loss(
+        log_rate, response, log_input=True, full=False, reduction="none"
+    )
+    weights = 1.0 + event_weight * (response > 0).to(element_loss.dtype)
+    return torch.sum(element_loss * weights) / torch.sum(weights)
+
+
+def temporal_correlation_loss(log_rate: torch.Tensor, response: torch.Tensor) -> torch.Tensor:
+    """Differentiable mean 1-Pearson over neurons with nonconstant targets."""
+    rate = torch.exp(log_rate).reshape(-1, log_rate.shape[-1])
+    target = response.reshape(-1, response.shape[-1])
+    rate = rate - rate.mean(dim=0, keepdim=True)
+    target = target - target.mean(dim=0, keepdim=True)
+    target_energy = torch.sum(target.square(), dim=0)
+    rate_energy = torch.sum(rate.square(), dim=0)
+    valid = target_energy > 1e-8
+    if not torch.any(valid):
+        return log_rate.new_zeros(())
+    correlation = torch.sum(rate * target, dim=0) / torch.sqrt(
+        rate_energy * target_energy + 1e-8
+    )
+    return 1.0 - correlation[valid].mean()
+
+
+def temporal_delta_loss(log_rate: torch.Tensor, response: torch.Tensor) -> torch.Tensor:
+    if response.shape[1] < 2:
+        return log_rate.new_zeros(())
+    return F.smooth_l1_loss(
+        torch.diff(torch.exp(log_rate), dim=1),
+        torch.diff(response, dim=1),
+    )
+
+
 def streaming_predict(model, video, chunk_pattern):
     """Run one sequence as a persistent stream with irregular chunk sizes."""
     outputs = []
@@ -172,6 +208,12 @@ def evaluate(
     ) if target.shape[1] > 1 else torch.full_like(response_correlations, torch.nan)
     response_summary = finite_summary(response_correlations)
     delta_summary = finite_summary(delta_correlations)
+    prediction_std = stream_rate.std(dim=(0, 1), unbiased=False)
+    target_std = target.std(dim=(0, 1), unbiased=False)
+    valid_modulation = target_std > 1e-8
+    modulation_ratio = torch.full_like(target_std, torch.nan)
+    modulation_ratio[valid_modulation] = prediction_std[valid_modulation] / target_std[valid_modulation]
+    modulation_summary = finite_summary(modulation_ratio)
 
     causal_max_errors = []
     causal_mean_errors = []
@@ -210,6 +252,12 @@ def evaluate(
             (delta_correlations[valid_delta] > 0).float().mean().item() if torch.any(valid_delta) else float("nan")
         ),
         "poisson_improved_fraction": (per_neuron_poisson < per_neuron_baseline).float().mean().item(),
+        "modulation_ratio_mean": modulation_summary["mean"],
+        "modulation_ratio_median": modulation_summary["median"],
+        "modulated_neuron_fraction": (
+            (modulation_ratio[valid_modulation] > 0.1).float().mean().item()
+            if torch.any(valid_modulation) else float("nan")
+        ),
         "valid_response_neurons": response_summary["valid"],
         "valid_delta_neurons": delta_summary["valid"],
         "causal_max_error": max(causal_max_errors, default=float("nan")),
@@ -220,6 +268,7 @@ def evaluate(
         "per_neuron_delta_correlation": delta_correlations.cpu().tolist(),
         "per_neuron_poisson": per_neuron_poisson.cpu().tolist(),
         "per_neuron_baseline_poisson": per_neuron_baseline.cpu().tolist(),
+        "per_neuron_modulation_ratio": modulation_ratio.cpu().tolist(),
     }
 
 
@@ -235,6 +284,8 @@ def print_evaluation(label: str, step: int | None, metrics: dict[str, float | in
         f"delta_r_mean={metrics['delta_correlation']:.4f} "
         f"delta_r_positive={metrics['positive_delta_fraction']:.1%} "
         f"neurons_better={metrics['poisson_improved_fraction']:.1%} "
+        f"modulation={metrics['modulation_ratio_median']:.3f} "
+        f"neurons_modulated={metrics['modulated_neuron_fraction']:.1%} "
         f"time_steps={metrics['unique_time_steps']} "
         f"causal_max={metrics['causal_max_error']:.3e} "
         f"stream_max={metrics['stream_max_error']:.3e}"
@@ -295,8 +346,13 @@ def train(args: argparse.Namespace) -> None:
             )
         model.load_state_dict(checkpoint["model"])
         optimizer.load_state_dict(checkpoint["optimizer"])
+        # Command-line fine-tuning settings must override values stored in the
+        # previous optimizer state.
+        for parameter_group in optimizer.param_groups:
+            parameter_group["lr"] = args.lr
+            parameter_group["weight_decay"] = args.weight_decay
         step = int(checkpoint.get("steps", 0))
-        print(f"resumed {args.resume} at step={step}")
+        print(f"resumed {args.resume} at step={step} lr={args.lr:g}")
 
     mean_response = torch.tensor(manifest["train_mean_response"], device=device)
     parameters = sum(parameter.numel() for parameter in model.parameters())
@@ -312,6 +368,9 @@ def train(args: argparse.Namespace) -> None:
     )
     model.train()
     running_loss = 0.0
+    running_poisson = 0.0
+    running_correlation = 0.0
+    running_delta = 0.0
     running_count = 0
     try:
         while step < args.steps:
@@ -319,17 +378,35 @@ def train(args: argparse.Namespace) -> None:
                 video, target = video.to(device), target.to(device)
                 optimizer.zero_grad(set_to_none=True)
                 log_rate = model(video).clamp(max=10.0)
-                loss = poisson_loss(log_rate, target)
+                loss_poisson = weighted_poisson_loss(log_rate, target, args.event_weight)
+                loss_correlation = temporal_correlation_loss(log_rate, target)
+                loss_delta = temporal_delta_loss(log_rate, target)
+                loss = (
+                    loss_poisson
+                    + args.correlation_weight * loss_correlation
+                    + args.delta_weight * loss_delta
+                )
                 loss.backward()
                 nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
                 optimizer.step()
                 step += 1
                 running_loss += loss.item()
+                running_poisson += loss_poisson.item()
+                running_correlation += loss_correlation.item()
+                running_delta += loss_delta.item()
                 running_count += 1
 
                 if step % args.log_every == 0:
-                    print(f"step={step:05d} train_poisson={running_loss/running_count:.6f}")
+                    print(
+                        f"step={step:05d} train_loss={running_loss/running_count:.6f} "
+                        f"poisson={running_poisson/running_count:.6f} "
+                        f"corr_loss={running_correlation/running_count:.6f} "
+                        f"delta_loss={running_delta/running_count:.6f}"
+                    )
                     running_loss = 0.0
+                    running_poisson = 0.0
+                    running_correlation = 0.0
+                    running_delta = 0.0
                     running_count = 0
                 if step % args.eval_every == 0:
                     validation_metrics = evaluate(
@@ -373,6 +450,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--grad-clip", type=float, default=1.0)
+    parser.add_argument("--correlation-weight", type=float, default=0.25)
+    parser.add_argument("--delta-weight", type=float, default=0.05)
+    parser.add_argument("--event-weight", type=float, default=1.0)
     parser.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
     parser.add_argument("--checkpoint", type=Path, default=Path("checkpoints/goldin2022_16layer.pt"))
     parser.add_argument("--resume", type=Path)
@@ -406,6 +486,8 @@ def main() -> None:
         raise SystemExit("--diagnostic-batches must be positive")
     if args.evaluation_max_steps < 0:
         raise SystemExit("--evaluation-max-steps cannot be negative")
+    if args.correlation_weight < 0 or args.delta_weight < 0 or args.event_weight < 0:
+        raise SystemExit("Loss weights cannot be negative")
     train(args)
 
 

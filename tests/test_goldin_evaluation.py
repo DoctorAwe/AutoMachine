@@ -9,6 +9,7 @@ from automachine.train_goldin2022 import (
     mean_neuron_correlation,
     neuron_correlations,
     streaming_predict,
+    temporal_correlation_loss,
 )
 
 
@@ -57,3 +58,14 @@ def test_per_neuron_correlation_preserves_distribution() -> None:
     prediction = torch.stack((target[..., 0], torch.flip(target[..., 1], dims=(1,))), dim=-1)
     correlations = neuron_correlations(prediction, target)
     torch.testing.assert_close(correlations, torch.tensor([1.0, -1.0]))
+
+
+def test_correlation_loss_penalizes_flat_rate_output() -> None:
+    target = torch.tensor([[[0.0], [1.0], [2.0], [4.0]]])
+    flat_log_rate = torch.zeros_like(target, requires_grad=True)
+    matching_log_rate = torch.log(target + 0.1).requires_grad_()
+    flat_loss = temporal_correlation_loss(flat_log_rate, target)
+    matching_loss = temporal_correlation_loss(matching_log_rate, target)
+    assert matching_loss < flat_loss
+    flat_loss.backward()
+    assert torch.isfinite(flat_log_rate.grad).all()
