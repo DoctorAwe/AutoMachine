@@ -202,3 +202,33 @@ batch 相关再平均，也不会重复计算重叠窗口的时间点。每次�
 ```
 
 训练完成会报告官方 test split 的 `test_poisson`。最终 checkpoint 同时保存模型配置与数据 manifest，便于之后恢复正确的输入通道和神经元输出维度。
+
+## 7. 在 Colab 启动在线演示
+
+安装界面依赖：
+
+```bash
+%cd /content/AutoMachine
+!python -m pip install -q -r requirements-demo.txt
+```
+
+使用新的深度融合 checkpoint：
+
+```bash
+!python -m automachine.demo_goldin2022 \
+  --checkpoint checkpoints/goldin2022_depth_fusion_v1.pt \
+  --data data/goldin2022/processed \
+  --device cuda \
+  --share
+```
+
+Colab 输出中会出现一个 Gradio 公网地址。打开后可以：
+
+- 在 validation/test 连续序列中选择起点和展示长度；
+- 选择一个神经元查看真实响应、流式模型响应和均值基线；
+- 设置 token 状态预热长度和不规则 chunk 序列；
+- 查看全部神经元的真实/预测响应热图；
+- 查看逐神经元 response correlation、delta correlation 和 Poisson；
+- 同时检查未来扰动因果误差与整段/流式一致性误差。
+
+演示会读取 checkpoint 内保存的模型配置，不会用当前代码默认值覆盖已经训练的 16 层深度融合模型。

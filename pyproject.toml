@@ -16,6 +16,10 @@ dev = [
 goldin2022 = [
     "h5py>=3.11",
 ]
+demo = [
+    "gradio>=5.0",
+    "plotly>=5.24",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

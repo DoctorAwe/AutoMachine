@@ -1,0 +1,3 @@
+-r requirements-goldin2022.txt
+gradio>=5.0
+plotly>=5.24
