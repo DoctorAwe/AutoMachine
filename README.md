@@ -10,6 +10,10 @@ AutoMachine 是面向“同步感知信号 → 同步响应/控制信号”的�
 
 新输入只进入第一层；旧状态每个内部时间步向下一层移动一次。前层默认更易接受强输入，后层更倾向保留自身状态。`forward_chunk` 可在任意数据块边界持续携带状态。
 
+模型现已加入固定容量的长期联想记忆。相似刺激可检索过去同一情景中的多感官潜在表示，并作为明确标记来源的联想Token参与注意力。槽位写入、融合、替换和跨进程保存方法见 [ASSOCIATIVE_MEMORY.md](ASSOCIATIVE_MEMORY.md)。
+
+在使用真实生物数据前，建议先按 [ASSOCIATIVE_SMOKE.md](ASSOCIATIVE_SMOKE.md) 在Colab运行随机线索—标签配对实验，分别比较正常记忆、清空记忆和错误记忆。
+
 ```python
 from automachine import SynchronousControlConfig, SynchronousControlProcessor
 

@@ -46,6 +46,18 @@ class SynchronousControlConfig:
     fusion_threshold_start: float = 0.05
     fusion_threshold_end: float = 0.20
     fusion_temperature: float = 0.025
+    associative_memory_enabled: bool = True
+    associative_memory_capacity: int = 256
+    associative_value_tokens: int = 8
+    associative_top_k: int = 4
+    associative_retrieval_threshold: float = 0.72
+    associative_retrieval_temperature: float = 0.10
+    associative_merge_key_threshold: float = 0.88
+    associative_merge_value_threshold: float = 0.80
+    associative_write_threshold: float = 0.65
+    associative_replacement_margin: float = 0.10
+    associative_protected_fraction: float = 0.125
+    associative_candidate_fraction: float = 0.25
 
     def __post_init__(self) -> None:
         positive = (
@@ -77,6 +89,60 @@ class SynchronousControlConfig:
             raise ValueError("fusion threshold must not decrease with pipeline depth")
         if self.fusion_temperature <= 0.0:
             raise ValueError("fusion_temperature must be positive")
+        if self.associative_memory_capacity <= 0:
+            raise ValueError("associative_memory_capacity must be positive")
+        if not 0 < self.associative_value_tokens:
+            raise ValueError("associative_value_tokens must be positive")
+        if not 0 < self.associative_top_k <= self.associative_memory_capacity:
+            raise ValueError("associative_top_k must be within memory capacity")
+        probabilities = (
+            self.associative_retrieval_threshold,
+            self.associative_merge_key_threshold,
+            self.associative_merge_value_threshold,
+            self.associative_write_threshold,
+            self.associative_protected_fraction,
+            self.associative_candidate_fraction,
+        )
+        if any(not 0.0 <= value <= 1.0 for value in probabilities):
+            raise ValueError("Associative thresholds/fractions must be in [0, 1]")
+        if self.associative_protected_fraction + self.associative_candidate_fraction >= 1.0:
+            raise ValueError("Protected and candidate fractions must leave stable capacity")
+        if self.associative_replacement_margin < 0:
+            raise ValueError("associative_replacement_margin cannot be negative")
+        if self.associative_retrieval_temperature <= 0:
+            raise ValueError("associative_retrieval_temperature must be positive")
+
+
+@dataclass
+class AssociativeMemoryState:
+    """Fixed-capacity, persistent episodic memory carried between chunks.
+
+    Tier 0 is a replaceable candidate, tier 1 is stable, and tier 2 is
+    protected. Contents are state, not trainable parameters.
+    """
+
+    keys: Tensor
+    values: Tensor
+    importance: Tensor
+    confidence: Tensor
+    usage: Tensor
+    age: Tensor
+    occupied: Tensor
+    tier: Tensor
+
+    def detach(self) -> "AssociativeMemoryState":
+        return AssociativeMemoryState(
+            self.keys.detach(), self.values.detach(), self.importance.detach(),
+            self.confidence.detach(), self.usage.detach(), self.age.detach(),
+            self.occupied.detach(), self.tier.detach(),
+        )
+
+    def to(self, device: torch.device) -> "AssociativeMemoryState":
+        return AssociativeMemoryState(
+            self.keys.to(device), self.values.to(device), self.importance.to(device),
+            self.confidence.to(device), self.usage.to(device), self.age.to(device),
+            self.occupied.to(device), self.tier.to(device),
+        )
 
 
 @dataclass
@@ -87,6 +153,7 @@ class ControlState:
     step: int = 0
     pending_video: Tensor | None = None
     pending_auxiliary: Tensor | None = None
+    associative: AssociativeMemoryState | None = None
 
     def detach(self) -> "ControlState":
         return ControlState(
@@ -94,6 +161,7 @@ class ControlState:
             self.step,
             None if self.pending_video is None else self.pending_video.detach(),
             None if self.pending_auxiliary is None else self.pending_auxiliary.detach(),
+            None if self.associative is None else self.associative.detach(),
         )
 
 
@@ -272,6 +340,198 @@ class TokenLayer(nn.Module):
         return gate * candidate + (1.0 - gate) * state
 
 
+class FixedAssociativeMemory(nn.Module):
+    """Bounded episodic memory with differentiable retrieval and stateful writes."""
+
+    def __init__(self, config: SynchronousControlConfig) -> None:
+        super().__init__()
+        self.config = config
+        dim = config.token_dim
+        value_tokens = config.associative_value_tokens
+        self.query_encoder = nn.Sequential(
+            nn.LayerNorm(dim), nn.Linear(dim, dim), nn.GELU(), nn.Linear(dim, dim)
+        )
+        self.value_query = nn.Parameter(torch.empty(1, value_tokens, dim))
+        self.value_attention = nn.MultiheadAttention(
+            dim, config.num_heads, dropout=config.dropout, batch_first=True
+        )
+        self.current_source = nn.Parameter(torch.empty(1, 1, dim))
+        self.recalled_source = nn.Parameter(torch.empty(1, 1, dim))
+        self.current_norm = nn.LayerNorm(dim)
+        self.recall_norm = nn.LayerNorm(dim)
+        nn.init.trunc_normal_(self.value_query, std=0.02)
+        nn.init.trunc_normal_(self.current_source, std=0.02)
+        nn.init.trunc_normal_(self.recalled_source, std=0.02)
+
+    def init_state(self, batch: int, device: torch.device, dtype: torch.dtype) -> AssociativeMemoryState:
+        capacity = self.config.associative_memory_capacity
+        dim = self.config.token_dim
+        value_tokens = self.config.associative_value_tokens
+        zeros = torch.zeros
+        return AssociativeMemoryState(
+            keys=zeros(batch, capacity, dim, device=device, dtype=dtype),
+            values=zeros(batch, capacity, value_tokens, dim, device=device, dtype=dtype),
+            importance=zeros(batch, capacity, device=device),
+            confidence=zeros(batch, capacity, device=device),
+            usage=zeros(batch, capacity, device=device),
+            age=zeros(batch, capacity, device=device),
+            occupied=torch.zeros(batch, capacity, device=device, dtype=torch.bool),
+            tier=torch.zeros(batch, capacity, device=device, dtype=torch.int8),
+        )
+
+    def encode(self, perception: Tensor) -> tuple[Tensor, Tensor]:
+        pooled = perception.mean(dim=1)
+        query = F.normalize(self.query_encoder(pooled), dim=-1)
+        value_query = self.value_query.expand(perception.shape[0], -1, -1)
+        value, _ = self.value_attention(value_query, perception, perception, need_weights=False)
+        return query, value
+
+    def current_tokens(self, value: Tensor) -> Tensor:
+        """Trainable compression used now and stored for later association."""
+        return self.current_norm(value + self.current_source)
+
+    def retrieve(
+        self, perception: Tensor, state: AssociativeMemoryState
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+        query, proposed_value = self.encode(perception)
+        similarities = torch.einsum("bd,bcd->bc", query, F.normalize(state.keys, dim=-1))
+        similarities = similarities.masked_fill(~state.occupied, -1.0)
+        reliability = (0.5 + 0.5 * state.confidence) * (
+            0.9 + 0.1 * state.importance
+        )
+        scores = similarities * reliability
+        top_scores, top_indices = torch.topk(
+            scores, k=self.config.associative_top_k, dim=-1
+        )
+        valid = top_scores >= self.config.associative_retrieval_threshold
+        safe_scores = top_scores.masked_fill(~valid, -1e4)
+        weights = torch.softmax(
+            safe_scores / self.config.associative_retrieval_temperature, dim=-1
+        ) * valid.to(top_scores.dtype)
+        weights = weights / weights.sum(dim=-1, keepdim=True).clamp_min(1e-8)
+        batch_index = torch.arange(perception.shape[0], device=perception.device)[:, None]
+        selected = state.values[batch_index, top_indices]
+        recalled = torch.sum(weights[..., None, None] * selected, dim=1)
+        recalled = self.recall_norm(recalled + self.recalled_source)
+        recalled = recalled * valid.any(dim=-1)[:, None, None]
+        return recalled, query, proposed_value, similarities
+
+    @torch.no_grad()
+    def write(
+        self,
+        state: AssociativeMemoryState,
+        query: Tensor,
+        proposed_value: Tensor,
+        similarities: Tensor,
+        external_salience: Tensor | None = None,
+    ) -> AssociativeMemoryState:
+        # Clone so prior states remain immutable snapshots for causal/debug use.
+        result = AssociativeMemoryState(
+            state.keys.clone(), state.values.clone(), state.importance.clone(),
+            state.confidence.clone(), state.usage.clone(), state.age.clone(),
+            state.occupied.clone(), state.tier.clone(),
+        )
+        result.age[result.occupied] += 1
+        capacity = self.config.associative_memory_capacity
+        candidate_start = int(capacity * (1.0 - self.config.associative_candidate_fraction))
+        protected_limit = int(capacity * self.config.associative_protected_fraction)
+
+        for batch in range(query.shape[0]):
+            occupied = result.occupied[batch]
+            best_similarity, best_index = similarities[batch].max(dim=0)
+            novelty = 1.0 - best_similarity.clamp(0.0, 1.0) if occupied.any() else query.new_tensor(1.0)
+            salience = novelty if external_salience is None else (
+                0.5 * novelty + 0.5 * external_salience[batch].clamp(0.0, 1.0)
+            )
+            if salience < self.config.associative_write_threshold and (
+                not occupied.any() or best_similarity < self.config.associative_merge_key_threshold
+            ):
+                continue
+
+            merge = bool(occupied.any() and best_similarity >= self.config.associative_merge_key_threshold)
+            if merge:
+                old_value = result.values[batch, best_index]
+                value_similarity = F.cosine_similarity(
+                    old_value.flatten(), proposed_value[batch].flatten(), dim=0
+                )
+                merge = bool(value_similarity >= self.config.associative_merge_value_threshold)
+            if merge:
+                count = result.usage[batch, best_index]
+                rate = 1.0 / (count + 2.0)
+                result.keys[batch, best_index] = F.normalize(
+                    (1.0 - rate) * result.keys[batch, best_index] + rate * query[batch], dim=-1
+                )
+                result.values[batch, best_index].lerp_(proposed_value[batch], rate)
+                result.usage[batch, best_index] += 1
+                result.confidence[batch, best_index] = (
+                    0.9 * result.confidence[batch, best_index] + 0.1 * best_similarity
+                ).clamp(0.0, 1.0)
+                result.importance[batch, best_index] = torch.maximum(
+                    result.importance[batch, best_index], salience
+                )
+                result.age[batch, best_index] = 0
+                if result.usage[batch, best_index] >= 8:
+                    result.tier[batch, best_index] = max(
+                        int(result.tier[batch, best_index]), 1
+                    )
+                if result.usage[batch, best_index] >= 32 and result.importance[batch, best_index] >= 0.8:
+                    result.tier[batch, best_index] = 2
+                    protected_empty = torch.flatnonzero(
+                        ~result.occupied[batch, :protected_limit]
+                    )
+                    if len(protected_empty) and int(best_index) >= protected_limit:
+                        destination = protected_empty[0]
+                        for tensor in (
+                            result.keys, result.values, result.importance, result.confidence,
+                            result.usage, result.age, result.occupied, result.tier,
+                        ):
+                            tensor[batch, destination] = tensor[batch, best_index]
+                        result.keys[batch, best_index].zero_()
+                        result.values[batch, best_index].zero_()
+                        result.importance[batch, best_index] = 0
+                        result.confidence[batch, best_index] = 0
+                        result.usage[batch, best_index] = 0
+                        result.age[batch, best_index] = 0
+                        result.occupied[batch, best_index] = False
+                        result.tier[batch, best_index] = 0
+                continue
+
+            slot_order = torch.cat((
+                torch.arange(candidate_start, capacity, device=query.device),
+                torch.arange(protected_limit, candidate_start, device=query.device),
+            ))
+            empty_candidates = slot_order[~occupied[slot_order]]
+            if len(empty_candidates):
+                slot = empty_candidates[0]
+            else:
+                replaceable = occupied & (result.tier[batch] < 2)
+                # Protected physical reserve is only usable by promoted memories.
+                replaceable[:protected_limit] = False
+                if not replaceable.any():
+                    continue
+                recency = torch.exp(-result.age[batch] / 128.0)
+                usage = torch.log1p(result.usage[batch]) / math.log(33.0)
+                retention = (
+                    0.35 * result.importance[batch]
+                    + 0.25 * result.confidence[batch]
+                    + 0.20 * usage.clamp(max=1.0)
+                    + 0.20 * recency
+                )
+                retention = retention.masked_fill(~replaceable, float("inf"))
+                slot = retention.argmin()
+                if salience <= retention[slot] + self.config.associative_replacement_margin:
+                    continue
+            result.keys[batch, slot] = query[batch]
+            result.values[batch, slot] = proposed_value[batch]
+            result.importance[batch, slot] = salience
+            result.confidence[batch, slot] = 0.5
+            result.usage[batch, slot] = 1
+            result.age[batch, slot] = 0
+            result.occupied[batch, slot] = True
+            result.tier[batch, slot] = 0
+        return result
+
+
 class TokenPipelineMemory(nn.Module):
     """Temporal shift pipeline: old layer i moves into layer i+1."""
 
@@ -343,11 +603,68 @@ class SynchronousControlProcessor(nn.Module):
 
     def __init__(self, config: SynchronousControlConfig | None = None) -> None:
         super().__init__()
-        self.config = config or SynchronousControlConfig()
+        default_config = SynchronousControlConfig()
+        legacy_config = config is not None and not hasattr(config, "associative_memory_enabled")
+        if config is None:
+            self.config = default_config
+        else:
+            # Dataclass instances stored in older checkpoints do not gain newly
+            # added fields when unpickled. Rebuild them with current defaults.
+            values = {
+                name: getattr(config, name, default)
+                for name, default in vars(default_config).items()
+            }
+            if legacy_config:
+                values["associative_memory_enabled"] = False
+            self.config = SynchronousControlConfig(**values)
         self.encoder = CausalVisualEncoder(self.config)
         self.fusion = PerceptionFusion(self.config)
+        self.associative_memory = FixedAssociativeMemory(self.config)
         self.memory = TokenPipelineMemory(self.config)
         self.decoder = ResponseDecoder(self.config)
+
+    def load_state_dict(self, state_dict, strict: bool = True, assign: bool = False):
+        if not any(name.startswith("associative_memory.") for name in state_dict):
+            strict = False
+        return super().load_state_dict(state_dict, strict=strict, assign=assign)
+
+    def init_state(
+        self, batch: int, device: torch.device, dtype: torch.dtype = torch.float32
+    ) -> ControlState:
+        state = self.memory.init_state(batch, device)
+        state.associative = self.associative_memory.init_state(batch, device, dtype)
+        return state
+
+    @staticmethod
+    def save_associative_memory(path: str, state: ControlState) -> None:
+        if state.associative is None:
+            raise ValueError("ControlState has no associative memory")
+        torch.save(state.associative.detach(), path)
+
+    @staticmethod
+    def load_associative_memory(
+        path: str, device: torch.device
+    ) -> AssociativeMemoryState:
+        memory = torch.load(path, map_location=device, weights_only=False)
+        if not isinstance(memory, AssociativeMemoryState):
+            raise TypeError("File does not contain AssociativeMemoryState")
+        return memory.to(device)
+
+    def associative_memory_statistics(self, state: ControlState) -> dict[str, float | int]:
+        if state.associative is None:
+            return {"capacity": self.config.associative_memory_capacity, "occupied": 0}
+        memory = state.associative
+        occupied = memory.occupied
+        return {
+            "capacity": int(memory.keys.shape[1]),
+            "occupied": int(occupied.sum().item()),
+            "candidate": int((occupied & (memory.tier == 0)).sum().item()),
+            "stable": int((occupied & (memory.tier == 1)).sum().item()),
+            "protected": int((occupied & (memory.tier == 2)).sum().item()),
+            "mean_confidence": (
+                float(memory.confidence[occupied].mean().item()) if occupied.any() else 0.0
+            ),
+        }
 
     def _join_pending(
         self, video: Tensor, auxiliary: Tensor | None, state: ControlState
@@ -366,11 +683,27 @@ class SynchronousControlProcessor(nn.Module):
         video: Tensor,
         auxiliary: Tensor | None = None,
         state: ControlState | None = None,
+        update_associative_memory: bool = True,
+        memory_salience: Tensor | None = None,
     ) -> tuple[Tensor, ControlState]:
         if video.ndim != 5 or video.shape[1] == 0:
             raise ValueError("video must be non-empty [B,T,C,H,W]")
         if state is None:
-            state = self.memory.init_state(video.shape[0], video.device)
+            state = self.init_state(video.shape[0], video.device, video.dtype)
+        elif state.associative is None:
+            # Backward compatibility for states created before associative
+            # memory was introduced.
+            state.associative = self.associative_memory.init_state(
+                video.shape[0], video.device, video.dtype
+            )
+        if state.associative.keys.shape[0] != video.shape[0]:
+            raise ValueError(
+                "Associative memory batch size differs from video batch size"
+            )
+        if state.associative.keys.shape[1:] != (
+            self.config.associative_memory_capacity, self.config.token_dim
+        ):
+            raise ValueError("Associative memory shape differs from model config")
         video, auxiliary = self._join_pending(video, auxiliary, state)
         group = self.config.frames_per_step
         complete = (video.shape[1] // group) * group
@@ -379,7 +712,9 @@ class SynchronousControlProcessor(nn.Module):
 
         if complete == 0:
             empty = video.new_empty((video.shape[0], 0, self.config.response_dim))
-            return empty, ControlState(state.layers, state.step, pending_video, pending_auxiliary)
+            return empty, ControlState(
+                state.layers, state.step, pending_video, pending_auxiliary, state.associative
+            )
 
         grouped_video = video[:, :complete]
         visual = self.encoder(grouped_video)
@@ -393,11 +728,35 @@ class SynchronousControlProcessor(nn.Module):
 
         outputs: list[Tensor] = []
         running = ControlState(state.layers, state.step)
+        associative = state.associative
         for timestep in range(perceptions.shape[1]):
-            readout, running = self.memory.forward_step(perceptions[:, timestep], running)
+            perception = perceptions[:, timestep]
+            if self.config.associative_memory_enabled:
+                recalled, query, proposed_value, similarities = self.associative_memory.retrieve(
+                    perception, associative
+                )
+                current_summary = self.associative_memory.current_tokens(proposed_value)
+                attended_perception = torch.cat(
+                    [perception, current_summary, recalled], dim=1
+                )
+            else:
+                attended_perception = perception
+            readout, running = self.memory.forward_step(attended_perception, running)
             outputs.append(self.decoder(readout))
+            if self.config.associative_memory_enabled and update_associative_memory:
+                salience = None
+                if memory_salience is not None:
+                    if memory_salience.shape[:2] != perceptions.shape[:2]:
+                        raise ValueError(
+                            "memory_salience must be [B, internal_time]"
+                        )
+                    salience = memory_salience[:, timestep]
+                associative = self.associative_memory.write(
+                    associative, query.detach(), proposed_value.detach(),
+                    similarities.detach(), salience,
+                )
         next_state = ControlState(
-            running.layers, running.step, pending_video, pending_auxiliary
+            running.layers, running.step, pending_video, pending_auxiliary, associative
         )
         return torch.stack(outputs, dim=1), next_state
 

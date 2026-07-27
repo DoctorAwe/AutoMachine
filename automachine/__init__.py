@@ -2,6 +2,7 @@
 
 from .model import (
     DEFAULT_STATE_TOKENS,
+    AssociativeMemoryState,
     ControlState,
     SynchronousControlConfig,
     SynchronousControlProcessor,
@@ -9,6 +10,7 @@ from .model import (
 
 __all__ = [
     "DEFAULT_STATE_TOKENS",
+    "AssociativeMemoryState",
     "ControlState",
     "SynchronousControlConfig",
     "SynchronousControlProcessor",
